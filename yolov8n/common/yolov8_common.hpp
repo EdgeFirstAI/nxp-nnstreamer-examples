@@ -10,8 +10,14 @@
 #ifndef YOLOV8_COMMON_HPP
 #define YOLOV8_COMMON_HPP
 
-#include <sys/time.h>
+#include <gst/gst.h>
+#include <nnstreamer_tensor_quant_meta.h>
+#include <glib-unix.h>
+
+#include <cstdint>
+#include <map>
 #include <string>
+#include <sys/time.h>
 #include <vector>
 #include <algorithm>
 
@@ -23,17 +29,10 @@
 #define NUM_COORDINATES     4         // Bounding box attributes (cx, cy, w, h)
 #define NUM_CLASSES         80        // COCO class count
 
-/* ─── Quantization parameters (from model inspection via Netron/eIQ) ── */
-
-#define ZERO_POINT          (-128)
-#define SCALE_FACTOR        0.00390632f
-
 /* ─── Post-processing thresholds ──────────────────────────────────── */
 
 #define CONF_THRESHOLD      0.25f
 #define NMS_IOU_THRESHOLD   0.45f
-// Threshold in quantized domain: quantized > (real / scale) + zero_point
-#define QUANTIZED_THRESHOLD static_cast<int>((CONF_THRESHOLD / SCALE_FACTOR) + ZERO_POINT)
 
 /* ─── Default source video dimensions ─────────────────────────────── */
 
@@ -90,6 +89,24 @@ struct LetterboxParams {
 LetterboxParams calculateLetterbox(int srcWidth, int srcHeight);
 
 
+/* ─── Quantization parameters from GstNnsTensorQuantMeta ─────────── */
+
+/** @brief Per-tensor quantization parameters extracted from GstNnsTensorQuantMeta */
+struct QuantParams {
+  double scale;
+  int64_t zeroPoint;
+};
+
+/**
+ * @brief Extract quantization parameters for a specific output tensor.
+ * @param buffer     GstBuffer with quant meta attached by tensor_filter
+ * @param tensorIdx  Output tensor index (0-based)
+ * @param out        Output: scale and zeroPoint
+ * @return true if quant meta was found and extracted
+ */
+bool extractQuantParams(GstBuffer *buffer, unsigned int tensorIdx, QuantParams &out);
+
+
 /** @brief COCO class names (80 classes) as C string array */
 extern const char *cocoClassNames[NUM_CLASSES];
 
@@ -98,5 +115,131 @@ std::vector<std::string> getCocoClassNames();
 
 /** @brief Print a timing metric line to stdout */
 void printMetric(const char *label, const char *desc, const TimingMetric &metric);
+
+
+/* ─── Argument Parsing ────────────────────────────────────────────── */
+
+/** @brief Bitmask flags for supported CLI arguments per binary */
+enum ArgFlag {
+  ARG_MODEL        = (1u << 0),
+  ARG_CAMERA       = (1u << 1),
+  ARG_VIDEO        = (1u << 2),
+  ARG_IMAGE        = (1u << 3),
+  ARG_HEADLESS     = (1u << 4),
+  ARG_INSTRUMENTED = (1u << 5),
+  ARG_NUM_FRAMES   = (1u << 6),
+  ARG_PLATFORM     = (1u << 7),
+  ARG_SPEED        = (1u << 8),
+};
+
+/** @brief Parsed CLI arguments */
+struct ParsedArgs {
+  std::string model;
+  std::string camera;
+  std::string video;
+  std::string image;
+  std::string platformStr;
+  bool headless = false;
+  bool instrumented = false;
+  int numFrames = 0;
+  double speed = 1.0;
+};
+
+/**
+ * @brief Unified CLI argument parser with bitmask-based flag selection.
+ *
+ * Dynamically builds getopt_long options and help text from supportedFlags.
+ * -c is always --camera, -n is --num-frames.
+ *
+ * @param argc        Argument count from main()
+ * @param argv        Argument vector from main()
+ * @param supportedFlags  Bitmask of ArgFlag values this binary supports
+ * @param binaryDesc  Short description for help text header
+ * @param args        Output: parsed arguments
+ * @return 0=success, 1=help printed (exit 0), -1=error (exit 1)
+ */
+int parseArgs(int argc, char **argv, uint32_t supportedFlags,
+              const char *binaryDesc, ParsedArgs &args);
+
+
+/* ─── Bus Callback + SIGINT Handler ───────────────────────────────── */
+
+/** @brief Callback type for printing timing statistics */
+typedef void (*TimingPrintFn)(void *appData);
+
+/** @brief Context for the common bus callback */
+struct BusCallbackCtx {
+  GstElement *pipeline;
+  GMainLoop *loop;
+  gboolean *playing;
+  bool *startedOnce;       // NULL to disable state-change suppression
+  bool videoLoop;
+  double videoRate;        // 1.0 = normal; uses gst_element_seek for != 1.0
+  TimingPrintFn printTiming;
+  void *appData;
+};
+
+/** @brief Common GStreamer bus message handler */
+void commonBusCallback(GstBus *bus, GstMessage *message, gpointer user_data);
+
+/** @brief Common SIGINT handler — prints timing and quits main loop */
+gboolean commonSigintHandler(gpointer user_data);
+
+
+/* ─── Throughput Tracker ──────────────────────────────────────────── */
+
+/** @brief Frame-to-frame interval tracker for throughput measurement */
+struct ThroughputTracker {
+  TimingMetric metric;
+  struct timeval lastFrameTime;
+  bool firstFrame;
+
+  void reset();
+  void tick(const struct timeval &now);
+};
+
+
+/* ─── PTS-Correlated E2E Tracker ─────────────────────────────────── */
+
+/** @brief PTS-correlated end-to-end latency tracker */
+struct PtsTracker {
+  std::map<GstClockTime, struct timeval> startTimes;
+  GMutex mutex;
+
+  void init();
+  void destroy();
+  void recordStart(GstBuffer *buffer, const struct timeval &now);
+  bool consumeStart(GstBuffer *buffer, struct timeval &startTime);
+};
+
+
+/* ─── Inference Latency Query ─────────────────────────────────────── */
+
+/** @brief Query the latency property from a tensor_filter element */
+void queryInferenceLatency(GstElement *tensorFilter, TimingMetric &metric);
+
+
+/* ─── Source Element Construction ─────────────────────────────────── */
+
+/** @brief Input source type */
+enum InputSource { INPUT_CAMERA_V4L2, INPUT_CAMERA_LIBCAMERA, INPUT_VIDEO, INPUT_IMAGE };
+
+/** @brief Determine input source from parsed args */
+InputSource determineInputSource(const ParsedArgs &args, bool usesLibcamerasrc);
+
+/**
+ * @brief Build a GStreamer source element string.
+ * @return g_strdup'd string — caller must g_free()
+ */
+char *buildSourceElement(InputSource source, const ParsedArgs &args,
+                         int srcWidth = SOURCE_WIDTH, int srcHeight = SOURCE_HEIGHT,
+                         int numBuffers = 0);
+
+
+/* ─── i.MX 95 Environment Setup ──────────────────────────────────── */
+
+/** @brief Set LIBCAMERA_PIPELINES_MATCH_LIST and NEUTRON_ENABLE_ZERO_COPY */
+void setupImx95Environment();
+
 
 #endif // YOLOV8_COMMON_HPP

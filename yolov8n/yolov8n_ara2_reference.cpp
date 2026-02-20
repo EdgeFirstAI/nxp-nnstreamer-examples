@@ -50,14 +50,6 @@
 #include "common/yolov8_common.hpp"
 
 
-/* ─── Ara-2 split tensor quantization parameters ─────────────────── */
-
-/* From model output postprocess_param (validated on-target):
- *   scores: uint8, qn=0.003906 (1/256)
- *   boxes:  int16, qn=0.019824, signed                             */
-#define ARA2_SCORES_QN   0.003906f
-#define ARA2_BOXES_QN    0.019824f
-
 #define NUM_OUTPUTS 2  /* scores + boxes tensors */
 
 
@@ -89,7 +81,6 @@ struct AppData {
   TimingMetric postprocTotal;
 
   /* Timing — end-to-end */
-  TimingMetric e2e;
   TimingMetric e2ePipeline;
 
   /* Timestamps for pad probe timing */
@@ -101,12 +92,6 @@ struct AppData {
   struct timeval transposeEnd;
   struct timeval tshift1End;
   struct timeval tshift2End;
-  struct timeval lastFrameTime;
-  bool firstFrame;
-
-  /* PTS-correlated E2E tracking */
-  std::map<GstClockTime, struct timeval> nnPipelineStart;
-  GMutex e2eMutex;
 
   /* Detection statistics */
   int totalDetections;
@@ -117,6 +102,16 @@ struct AppData {
 
   GstElement *tensorFilter;
   LetterboxParams letterboxParams;
+
+  /* Quantization parameters (from GstNnsTensorQuantMeta) */
+  double scoresScale;
+  double boxesScale;
+  bool quantInitialized = false;
+
+  /* Common infrastructure */
+  BusCallbackCtx busCtx;
+  ThroughputTracker throughput;
+  PtsTracker ptsTracker;
 };
 
 
@@ -129,16 +124,7 @@ g2dSinkProbe(GstPad *, GstPadProbeInfo *info, gpointer user_data)
   gettimeofday(&app->g2dStart, NULL);
 
   GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-  if (buffer) {
-    GstClockTime pts = GST_BUFFER_PTS(buffer);
-    if (GST_CLOCK_TIME_IS_VALID(pts)) {
-      g_mutex_lock(&app->e2eMutex);
-      app->nnPipelineStart[pts] = app->g2dStart;
-      while (app->nnPipelineStart.size() > 100)
-        app->nnPipelineStart.erase(app->nnPipelineStart.begin());
-      g_mutex_unlock(&app->e2eMutex);
-    }
-  }
+  app->ptsTracker.recordStart(buffer, app->g2dStart);
   return GST_PAD_PROBE_OK;
 }
 
@@ -209,8 +195,10 @@ tshift2SrcProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
 
 /* ─── Timing report ───────────────────────────────────────────────── */
 
-static void printTiming(AppData *app)
+static void printTiming(void *userData)
 {
+  AppData *app = (AppData *)userData;
+
   printf("\n");
   printf("===================================================================="
          "========\n");
@@ -336,13 +324,14 @@ static void printTiming(AppData *app)
     printf("     Coverage: %6.1f%%\n", coverage);
   }
 
-  if (app->e2e.count > 0) {
-    double avgMs = app->e2e.avg();
+  if (app->throughput.metric.count > 0) {
+    double avgMs = app->throughput.metric.avg();
     printf("\n  4. Frame Throughput\n");
     printf("     Average: %7.3f ms (%5.1f FPS)  |  Min: %7.3f ms  |"
            "  Max: %7.3f ms\n",
-        avgMs, 1000.0 / avgMs, app->e2e.minMs, app->e2e.maxMs);
-    printf("     Frames: %d\n", app->e2e.count);
+        avgMs, 1000.0 / avgMs, app->throughput.metric.minMs,
+        app->throughput.metric.maxMs);
+    printf("     Frames: %d\n", app->throughput.metric.count);
   }
 
   printf("\n===================================================================="
@@ -367,45 +356,6 @@ static void printTiming(AppData *app)
 }
 
 
-/* ─── GStreamer bus callback ──────────────────────────────────────── */
-
-static void busCallback(GstBus *, GstMessage *msg, gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  switch (GST_MESSAGE_TYPE(msg)) {
-    case GST_MESSAGE_ERROR:{
-      GError *err = NULL;
-      gchar *dbg = NULL;
-      gst_message_parse_error(msg, &err, &dbg);
-      g_printerr("\nERROR from %s: %s\n",
-          GST_OBJECT_NAME(msg->src), err->message);
-      if (dbg)
-        g_printerr("Debug: %s\n", dbg);
-      g_error_free(err);
-      g_free(dbg);
-      g_main_loop_quit(app->loop);
-      break;
-    }
-    case GST_MESSAGE_EOS:
-      gst_element_seek_simple(app->pipeline, GST_FORMAT_TIME,
-                              (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), 0);
-      break;
-    case GST_MESSAGE_STATE_CHANGED:
-      if (GST_MESSAGE_SRC(msg) == GST_OBJECT(app->pipeline)) {
-        GstState old_s, new_s, pending;
-        gst_message_parse_state_changed(msg, &old_s, &new_s, &pending);
-        g_print("Pipeline: %s -> %s\n",
-            gst_element_state_get_name(old_s),
-            gst_element_state_get_name(new_s));
-        app->playing = (new_s == GST_STATE_PLAYING);
-      }
-      break;
-    default:
-      break;
-  }
-}
-
-
 /* ─── tensor_sink new-data callback ───────────────────────────────── */
 
 static void
@@ -417,19 +367,10 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   AppData *app = (AppData *)user_data;
 
   /* Frame-to-frame interval */
-  if (!app->firstFrame) {
-    app->e2e.record(timeDiffMs(app->lastFrameTime, callbackStart));
-  }
-  app->lastFrameTime = callbackStart;
-  app->firstFrame = false;
+  app->throughput.tick(callbackStart);
 
   /* Inference latency from tensor_filter */
-  if (app->tensorFilter) {
-    gint64 latUs = 0;
-    g_object_get(app->tensorFilter, "latency", &latUs, NULL);
-    if (latUs > 0)
-      app->inference.record(latUs / 1000.0);
-  }
+  queryInferenceLatency(app->tensorFilter, app->inference);
 
   /* Validate buffer — expect 2 memory blocks (scores + boxes) */
   if (!GST_IS_BUFFER(buffer)) {
@@ -460,16 +401,25 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   gettimeofday(&mmapEnd, NULL);
   app->outputMmap.record(timeDiffMs(callbackStart, mmapEnd));
 
+  /* Extract quantization parameters from GstNnsTensorQuantMeta on first frame */
+  if (!app->quantInitialized) {
+    QuantParams scores_qp, boxes_qp;
+    if (!extractQuantParams(buffer, 0, scores_qp) ||
+        !extractQuantParams(buffer, 1, boxes_qp)) {
+      g_printerr("ERROR: No quant meta — requires updated NNStreamer\n");
+      gst_memory_unmap(score_mem, &score_map);
+      gst_memory_unmap(box_mem, &box_map);
+      return;
+    }
+    app->scoresScale = scores_qp.scale;
+    app->boxesScale = boxes_qp.scale;
+    app->quantInitialized = true;
+  }
+
   const uint8_t *scores = (const uint8_t *)score_map.data;
   const int16_t *boxes = (const int16_t *)box_map.data;
 
-  /* Dequantization + box extraction from split tensors.
-   *
-   * Scores: uint8 [80, 8400] — qn=0.003906 (1/256), no zero point
-   * Boxes:  int16 [4, 8400]  — qn=0.019824, signed
-   *
-   * Box coordinates are in model pixel space [0, 640] (not normalized).
-   * Layout is [feat_dim, boxes] — innermost dimension is feature. */
+  /* Dequantization + box extraction from split tensors. */
   struct Detection {
     float x, y, w, h;
     float conf;
@@ -479,7 +429,6 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   std::vector<Detection> candidates;
 
   for (int bIdx = 0; bIdx < NUM_TOTAL_BOXES; bIdx++) {
-    /* Find best class for this box */
     int maxClassIdx = -1;
     uint8_t maxScore = 0;
 
@@ -491,18 +440,15 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
       }
     }
 
-    float conf = maxScore * ARA2_SCORES_QN;
+    float conf = maxScore * app->scoresScale;
     if (conf < CONF_THRESHOLD)
       continue;
 
-    /* Dequantize box coordinates (int16, signed, qn=0.019824).
-     * Result is in model pixel space [0, 640] as cx, cy, w, h. */
-    float cx = boxes[0 * NUM_TOTAL_BOXES + bIdx] * ARA2_BOXES_QN;
-    float cy = boxes[1 * NUM_TOTAL_BOXES + bIdx] * ARA2_BOXES_QN;
-    float bw = boxes[2 * NUM_TOTAL_BOXES + bIdx] * ARA2_BOXES_QN;
-    float bh = boxes[3 * NUM_TOTAL_BOXES + bIdx] * ARA2_BOXES_QN;
+    float cx = boxes[0 * NUM_TOTAL_BOXES + bIdx] * app->boxesScale;
+    float cy = boxes[1 * NUM_TOTAL_BOXES + bIdx] * app->boxesScale;
+    float bw = boxes[2 * NUM_TOTAL_BOXES + bIdx] * app->boxesScale;
+    float bh = boxes[3 * NUM_TOTAL_BOXES + bIdx] * app->boxesScale;
 
-    /* Convert center coords to top-left, remove letterbox, scale to source */
     float px = (cx - app->letterboxParams.padX) / app->letterboxParams.scale;
     float py = (cy - app->letterboxParams.padY) / app->letterboxParams.scale;
     float pw = bw / app->letterboxParams.scale;
@@ -544,7 +490,6 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
       if (suppressed[j])
         continue;
 
-      /* IoU calculation */
       float x1 = std::max(candidates[i].x, candidates[j].x);
       float y1 = std::max(candidates[i].y, candidates[j].y);
       float x2 = std::min(candidates[i].x + candidates[i].w,
@@ -603,28 +548,10 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   app->postprocTotal.record(timeDiffMs(callbackStart, nmsEnd));
 
   /* PTS-correlated E2E */
-  GstClockTime pts = GST_BUFFER_PTS(buffer);
-  if (GST_CLOCK_TIME_IS_VALID(pts)) {
-    g_mutex_lock(&app->e2eMutex);
-    auto it = app->nnPipelineStart.find(pts);
-    if (it != app->nnPipelineStart.end()) {
-      app->e2ePipeline.record(timeDiffMs(it->second, nmsEnd));
-      app->nnPipelineStart.erase(it);
-    }
-    g_mutex_unlock(&app->e2eMutex);
+  struct timeval ptsStart;
+  if (app->ptsTracker.consumeStart(buffer, ptsStart)) {
+    app->e2ePipeline.record(timeDiffMs(ptsStart, nmsEnd));
   }
-}
-
-
-/* ─── SIGINT handler ──────────────────────────────────────────────── */
-
-static gboolean sigintHandler(gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  g_print("\nSIGINT — stopping.\n");
-  printTiming(app);
-  g_main_loop_quit(app->loop);
-  return TRUE;
 }
 
 
@@ -664,61 +591,22 @@ static void installProbes(GstElement *pipeline, AppData *app)
 }
 
 
-/* ─── Command line ────────────────────────────────────────────────── */
-
-static int parseArgs(int argc, char **argv,
-    std::string &model, std::string &video, int &numFrames)
-{
-  static struct option long_opts[] = {
-    {"help", no_argument, 0, 'h'},
-    {"model", required_argument, 0, 'm'},
-    {"video", required_argument, 0, 'v'},
-    {"frames", required_argument, 0, 'n'},
-    {0, 0, 0, 0}
-  };
-
-  int c;
-  while ((c = getopt_long(argc, argv, "hm:v:n:", long_opts, NULL)) != -1) {
-    switch (c) {
-      case 'h':
-        std::cout
-            << "YOLOv8n 640x640 Reference Pipeline for Kinara Ara-2 NPU\n\n"
-            << "Usage: " << argv[0] << " -m MODEL.dvm -v VIDEO.mp4 [-n FRAMES]\n\n"
-            << "Options:\n"
-            << "  -m, --model PATH    Path to YOLOv8n .dvm model [required]\n"
-            << "  -v, --video PATH    Path to H.264 MP4 video [required]\n"
-            << "  -n, --frames N      Stop after N frames and print timing (0=infinite)\n"
-            << "  -h, --help          Show this help\n";
-        return 1;
-      case 'm':
-        model = optarg;
-        break;
-      case 'v':
-        video = optarg;
-        break;
-      case 'n':
-        numFrames = atoi(optarg);
-        break;
-    }
-  }
-  return 0;
-}
-
-
 /* ─── Main ────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
 {
-  std::string model, video;
-  int numFrames = 0;
-  if (parseArgs(argc, argv, model, video, numFrames))
-    return 0;
+  ParsedArgs pargs;
+  uint32_t flags = ARG_MODEL | ARG_VIDEO | ARG_NUM_FRAMES;
 
-  if (model.empty()) {
+  int ret = parseArgs(argc, argv, flags,
+      "YOLOv8n 640x640 Reference Pipeline for Kinara Ara-2 NPU", pargs);
+  if (ret != 0) return ret > 0 ? 0 : 1;
+
+  if (pargs.model.empty()) {
     g_printerr("ERROR: provide model path with -m\n");
     return 1;
   }
-  if (video.empty()) {
+  if (pargs.video.empty()) {
     g_printerr("ERROR: provide video path with -v\n");
     return 1;
   }
@@ -731,12 +619,7 @@ int main(int argc, char **argv)
       SOURCE_WIDTH, SOURCE_HEIGHT, lb.scale, lb.scaledW, lb.scaledH,
       lb.padX, lb.padRight, lb.padY, lb.padBottom);
 
-  /* Pipeline: standard NXP preprocessing + Ara-2 NPU inference.
-   *
-   * The 7-element preprocessing chain produces int8 CHW tensors matching
-   * the model's native format. This CPU-heavy pipeline serves as a baseline
-   * for comparison against the EdgeFirst-optimized pipeline (which replaces
-   * the entire chain with a single edgefirstcameraadaptor element). */
+  /* Pipeline: standard NXP preprocessing + Ara-2 NPU inference. */
   gchar *pipelineStr = g_strdup_printf(
       "filesrc location=%s ! qtdemux ! h264parse ! v4l2h264dec ! "
       "queue name=thread-nn leaky=2 max-size-buffers=2 ! "
@@ -752,19 +635,19 @@ int main(int argc, char **argv)
       "tensor_filter name=tfilter framework=ara2 model=%s "
       "custom=EnableStats:true latency=1 ! "
       "tensor_sink name=inferenceOutput",
-      video.c_str(),
+      pargs.video.c_str(),
       lb.scaledW, lb.scaledH,
       -lb.padX, -lb.padRight, -lb.padY, -lb.padBottom,
-      model.c_str());
+      pargs.model.c_str());
 
   g_print("Pipeline:\n%s\n\n", pipelineStr);
 
-  if (numFrames > 0)
-    g_print("Frames: %d\n", numFrames);
+  if (pargs.numFrames > 0)
+    g_print("Frames: %d\n", pargs.numFrames);
 
   AppData app = {};
   app.letterboxParams = lb;
-  app.maxFrames = numFrames;
+  app.maxFrames = pargs.numFrames;
   app.g2dScale.reset();
   app.letterbox.reset();
   app.colorconv.reset();
@@ -778,10 +661,9 @@ int main(int argc, char **argv)
   app.dequantExtract.reset();
   app.nms.reset();
   app.postprocTotal.reset();
-  app.e2e.reset();
   app.e2ePipeline.reset();
-  app.firstFrame = true;
-  g_mutex_init(&app.e2eMutex);
+  app.throughput.reset();
+  app.ptsTracker.init();
 
   app.loop = g_main_loop_new(NULL, FALSE);
   app.pipeline = gst_parse_launch(pipelineStr, NULL);
@@ -792,10 +674,20 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  // Setup bus callback context
+  app.busCtx.pipeline = app.pipeline;
+  app.busCtx.loop = app.loop;
+  app.busCtx.playing = &app.playing;
+  app.busCtx.startedOnce = NULL;  // No state-change suppression for this binary
+  app.busCtx.videoLoop = true;    // Always loop video
+  app.busCtx.videoRate = 1.0;
+  app.busCtx.printTiming = printTiming;
+  app.busCtx.appData = &app;
+
   /* Bus */
   app.bus = gst_element_get_bus(app.pipeline);
   gst_bus_add_signal_watch(app.bus);
-  g_signal_connect(app.bus, "message", G_CALLBACK(busCallback), &app);
+  g_signal_connect(app.bus, "message", G_CALLBACK(commonBusCallback), &app.busCtx);
 
   /* tensor_sink */
   GstElement *tsink = gst_bin_get_by_name(GST_BIN(app.pipeline),
@@ -809,7 +701,7 @@ int main(int argc, char **argv)
   /* Install timing probes */
   installProbes(app.pipeline, &app);
 
-  g_unix_signal_add(SIGINT, sigintHandler, &app);
+  g_unix_signal_add(SIGINT, commonSigintHandler, &app.busCtx);
 
   /* Run */
   gst_element_set_state(app.pipeline, GST_STATE_PLAYING);
@@ -822,7 +714,7 @@ int main(int argc, char **argv)
   gst_object_unref(app.bus);
   gst_object_unref(app.pipeline);
   g_main_loop_unref(app.loop);
-  g_mutex_clear(&app.e2eMutex);
+  app.ptsTracker.destroy();
 
   return 0;
 }

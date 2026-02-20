@@ -50,6 +50,15 @@
 
 #define DEFAULT_CAMERA_DEVICE "/dev/video3"
 
+// HAL JSON template — quantization filled from GstNnsTensorQuantMeta at runtime
+static const char *HAL_CONFIG_FMT =
+    "{\"outputs\":[{\"decoder\":\"ultralytics\","
+    "\"type\":\"detection\","
+    "\"shape\":[1,84,8400],"
+    "\"quantization\":[%g,%" G_GINT64_FORMAT "],"
+    "\"dshape\":[[\"batch\",1],[\"num_features\",84],[\"num_boxes\",8400]]}],"
+    "\"nms\":\"class_agnostic\"}";
+
 
 /* ─── Timing statistics ───────────────────────────────────────────── */
 
@@ -69,20 +78,13 @@ typedef struct {
   // Rendering
   TimingMetric cairoDraw;
 
-  // End-to-end
-  TimingMetric e2e;
+  // End-to-end (PTS-correlated)
   TimingMetric e2ePipeline;
 
   // Timestamps
   struct timeval g2dStart;
   struct timeval g2dEnd;
   struct timeval tensorconvEnd;
-  struct timeval lastFrameTime;
-  bool firstFrame;
-
-  // PTS-correlated E2E
-  std::map<GstClockTime, struct timeval> nnPipelineStart;
-  GMutex e2eMutex;
 
   // Detection statistics
   int totalDetections;
@@ -110,8 +112,11 @@ typedef struct {
   LetterboxParams letterbox;
   bool headless;
   bool instrumented;
-  bool videoLoop;
-  bool startedOnce;
+
+  // Common infrastructure
+  BusCallbackCtx busCtx;
+  ThroughputTracker throughput;
+  PtsTracker ptsTracker;
 
   // HAL decoder
   hal_decoder *decoder;
@@ -126,16 +131,7 @@ static GstPadProbeReturn g2dSinkProbe(GstPad *, GstPadProbeInfo *info, gpointer 
   gettimeofday(&app->timing.g2dStart, NULL);
 
   GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-  if (buffer) {
-    GstClockTime pts = GST_BUFFER_PTS(buffer);
-    if (GST_CLOCK_TIME_IS_VALID(pts)) {
-      g_mutex_lock(&app->timing.e2eMutex);
-      app->timing.nnPipelineStart[pts] = app->timing.g2dStart;
-      while (app->timing.nnPipelineStart.size() > 100)
-        app->timing.nnPipelineStart.erase(app->timing.nnPipelineStart.begin());
-      g_mutex_unlock(&app->timing.e2eMutex);
-    }
-  }
+  app->ptsTracker.recordStart(buffer, app->timing.g2dStart);
   return GST_PAD_PROBE_OK;
 }
 
@@ -159,8 +155,10 @@ static GstPadProbeReturn tensorconvSrcProbe(GstPad *, GstPadProbeInfo *, gpointe
 
 /* ─── Timing report ───────────────────────────────────────────────── */
 
-static void printTimingStatistics(AppData *app)
+static void printTimingStatistics(void *userData)
 {
+  AppData *app = (AppData *)userData;
+
   printf("\n");
   printf("==============================================================================\n");
   if (app->headless)
@@ -222,18 +220,26 @@ static void printTimingStatistics(AppData *app)
   printf("\n  END-TO-END\n");
   printf("  --------------------------------------------------------------------------\n");
 
+  double sumPreproc = app->timing.preprocTotal.avg();
+  double sumInference = app->timing.inference.avg();
+  double sumPostproc = app->timing.postprocTotal.avg();
+  double sumNN = sumPreproc + sumInference + sumPostproc;
+
   if (app->timing.e2ePipeline.count > 0) {
-    printf("  E2E NN Pipeline (PTS-correlated):\n");
+    printf("\n  E2E NN Pipeline (PTS-correlated: g2d sink -> post-processing)\n");
     printf("     Average: %7.3f ms  |  Min: %7.3f ms  |  Max: %7.3f ms  [%d frames]\n",
            app->timing.e2ePipeline.avg(), app->timing.e2ePipeline.minMs,
            app->timing.e2ePipeline.maxMs, app->timing.e2ePipeline.count);
+
+    double coverage = (sumNN / app->timing.e2ePipeline.avg()) * 100.0;
+    printf("     Sum of stages: %7.3f ms  |  Coverage: %.1f%%\n", sumNN, coverage);
   }
 
-  if (app->timing.e2e.count > 0) {
-    double avgMs = app->timing.e2e.avg();
+  if (app->throughput.metric.count > 0) {
+    double avgMs = app->throughput.metric.avg();
     printf("\n  Frame Throughput:\n");
     printf("     Average: %7.3f ms (%5.1f FPS)  |  Frames: %d\n",
-           avgMs, 1000.0 / avgMs, app->timing.e2e.count);
+           avgMs, 1000.0 / avgMs, app->throughput.metric.count);
   }
 
   printf("\n  Detection Statistics:\n");
@@ -265,63 +271,6 @@ static void printTimingStatistics(AppData *app)
 
 /* ─── GStreamer callbacks ─────────────────────────────────────────── */
 
-static gboolean sigintHandler(gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  log_info("SIGINT — stopping.\n");
-  printTimingStatistics(app);
-  g_main_loop_quit(app->loop);
-  return TRUE;
-}
-
-static void busCallback(GstBus *, GstMessage *message, gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  switch (GST_MESSAGE_TYPE(message)) {
-    case GST_MESSAGE_ERROR: {
-      GError *err;
-      gchar *debugInfo;
-      gst_message_parse_error(message, &err, &debugInfo);
-      log_error("Error from %s: %s\n", GST_OBJECT_NAME(message->src), err->message);
-      g_error_free(err);
-      g_free(debugInfo);
-      g_main_loop_quit(app->loop);
-      break;
-    }
-    case GST_MESSAGE_EOS:
-      if (app->videoLoop) {
-        gst_element_seek_simple(app->gstPipeline, GST_FORMAT_TIME,
-                                (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), 0);
-      } else {
-        log_info("End-Of-Stream.\n");
-        printTimingStatistics(app);
-        g_main_loop_quit(app->loop);
-      }
-      break;
-    case GST_MESSAGE_STATE_CHANGED: {
-      GstState oldState, newState, pendingState;
-      gst_message_parse_state_changed(message, &oldState, &newState, &pendingState);
-      if (GST_MESSAGE_SRC(message) == GST_OBJECT(app->gstPipeline) &&
-          oldState != newState) {
-        if (!app->startedOnce) {
-          log_info("Pipeline: %s -> %s\n",
-                   gst_element_state_get_name(oldState),
-                   gst_element_state_get_name(newState));
-        }
-        if (newState == GST_STATE_PLAYING) {
-          app->playing = true;
-          app->startedOnce = true;
-        } else {
-          app->playing = false;
-        }
-      }
-      break;
-    }
-    default:
-      break;
-  }
-}
-
 static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
 {
   struct timeval callbackStart, halStart, halEnd;
@@ -330,23 +279,41 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   AppData *app = (AppData *)user_data;
 
   // Frame-to-frame interval
-  if (!app->timing.firstFrame)
-    app->timing.e2e.record(timeDiffMs(app->timing.lastFrameTime, callbackStart));
-  app->timing.lastFrameTime = callbackStart;
-  app->timing.firstFrame = false;
+  app->throughput.tick(callbackStart);
 
   // Inference latency
-  if (app->tensorFilter) {
-    gint64 latencyUs = 0;
-    g_object_get(app->tensorFilter, "latency", &latencyUs, NULL);
-    if (latencyUs > 0)
-      app->timing.inference.record(latencyUs / 1000.0);
-  }
+  queryInferenceLatency(app->tensorFilter, app->timing.inference);
 
   // Validate buffer
   if (!GST_IS_BUFFER(buffer)) { log_error("Invalid buffer\n"); return; }
   guint n_mem = gst_buffer_n_memory(buffer);
   if (n_mem != 1) { log_error("Expected 1 tensor, got %u\n", n_mem); return; }
+
+  // Lazy HAL decoder init — extract quant params from GstNnsTensorQuantMeta
+  if (!app->decoder) {
+    QuantParams qp;
+    if (!extractQuantParams(buffer, 0, qp)) {
+      log_error("No quant meta on output buffer — requires updated NNStreamer\n");
+      return;
+    }
+    log_info("Quant meta: scale=%g zero_point=%" G_GINT64_FORMAT "\n",
+             qp.scale, qp.zeroPoint);
+
+    gchar *json = g_strdup_printf(HAL_CONFIG_FMT, qp.scale, qp.zeroPoint);
+    hal_decoder_params params = hal_decoder_params_default();
+    params.config_json = json;
+    params.score_threshold = CONF_THRESHOLD;
+    params.iou_threshold = NMS_IOU_THRESHOLD;
+    params.nms = HAL_NMS_CLASS_AGNOSTIC;
+    app->decoder = hal_decoder_new(&params);
+    g_free(json);
+
+    if (!app->decoder) {
+      log_error("Failed to create HAL decoder\n");
+      return;
+    }
+    log_info("HAL decoder: created successfully\n");
+  }
 
   // Map output tensor
   // NOTE: With DMA-BUF V2 path, we must keep the mapping valid while reading
@@ -420,15 +387,9 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   app->timing.postprocTotal.record(timeDiffMs(callbackStart, postEnd));
 
   // PTS-correlated E2E
-  GstClockTime pts = GST_BUFFER_PTS(buffer);
-  if (GST_CLOCK_TIME_IS_VALID(pts)) {
-    g_mutex_lock(&app->timing.e2eMutex);
-    auto it = app->timing.nnPipelineStart.find(pts);
-    if (it != app->timing.nnPipelineStart.end()) {
-      app->timing.e2ePipeline.record(timeDiffMs(it->second, postEnd));
-      app->timing.nnPipelineStart.erase(it);
-    }
-    g_mutex_unlock(&app->timing.e2eMutex);
+  struct timeval ptsStart;
+  if (app->ptsTracker.consumeStart(buffer, ptsStart)) {
+    app->timing.e2ePipeline.record(timeDiffMs(ptsStart, postEnd));
   }
 }
 
@@ -446,7 +407,8 @@ static void drawCallback(GstElement *, cairo_t *cr, guint64, guint64, gpointer u
   for (auto &det : app->results) {
     cairo_rectangle(cr, det.x, det.y, det.w, det.h);
     cairo_move_to(cr, det.x + 5, det.y + 15);
-    const char *name = (det.classId < NUM_CLASSES) ? cocoClassNames[det.classId] : "?";
+    const char *name = (det.classId >= 0 && det.classId < NUM_CLASSES)
+        ? cocoClassNames[det.classId] : "?";
     char label[64];
     snprintf(label, sizeof(label), "%s %.0f%%", name, det.score * 100);
     cairo_show_text(cr, label);
@@ -458,117 +420,43 @@ static void drawCallback(GstElement *, cairo_t *cr, guint64, guint64, gpointer u
 }
 
 
-/* ─── Command line ────────────────────────────────────────────────── */
-
-static int parseArgs(int argc, char **argv, std::string &model, std::string &camera,
-                     std::string &video, std::string &image, int &numFrames, bool &headless,
-                     bool &instrumented)
-{
-  static struct option longOptions[] = {
-    {"help",         no_argument,       0, 'h'},
-    {"model",        required_argument, 0, 'm'},
-    {"camera",       required_argument, 0, 'c'},
-    {"video",        required_argument, 0, 'v'},
-    {"image",        required_argument, 0, 'i'},
-    {"frames",       required_argument, 0, 'n'},
-    {"headless",     no_argument,       0, 'H'},
-    {"instrumented", no_argument,       0, 'I'},
-    {0, 0, 0, 0}
-  };
-
-  int c;
-  while ((c = getopt_long(argc, argv, "hm:c:v:i:n:HI", longOptions, NULL)) != -1) {
-    switch (c) {
-      case 'h':
-        std::cout
-            << "YOLOv8n 640x640 for i.MX 8M Plus — EdgeFirst Optimized\n\n"
-            << "Usage: " << argv[0] << " -m MODEL [options]\n\n"
-            << "Options:\n"
-            << "  -m, --model PATH        Model file (.tflite) [required]\n"
-            << "  -c, --camera DEVICE     Camera device (default: " << DEFAULT_CAMERA_DEVICE << ")\n"
-            << "  -v, --video FILE        Video file input (H.264 MP4)\n"
-            << "  -i, --image FILE        Static image input (JPEG)\n"
-            << "  -n, --frames N          Stop after N frames (0=infinite, default=0)\n"
-            << "  -I, --instrumented      Enable detailed timing breakdown\n"
-            << "  -H, --headless          No display output\n"
-            << "  -h, --help              Show this help\n\n"
-            << "EdgeFirst optimizations:\n"
-            << "  * tensorflow2-lite V2 invoke with DMA-BUF zero-copy\n"
-            << "  * G2D keep-ratio=true: HW letterbox to delegate DMA-BUF\n"
-            << "  * CameraAdaptor:rgba: NPU handles RGBA->RGB + UINT8->INT8\n"
-            << "  * EdgeFirst HAL: quantized NMS (no CPU dequantization)\n";
-        return 1;
-      case 'm': model = optarg; break;
-      case 'c': camera = optarg; break;
-      case 'v': video = optarg; break;
-      case 'i': image = optarg; break;
-      case 'n': numFrames = atoi(optarg); break;
-      case 'H': headless = true; break;
-      case 'I': instrumented = true; break;
-    }
-  }
-  return 0;
-}
-
-
 /* ─── Main ────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
 {
-  std::string model;
-  std::string camera = DEFAULT_CAMERA_DEVICE;
-  std::string video;
-  std::string image;
-  int numFrames = 0;
-  bool headless = false;
-  bool instrumented = false;
+  ParsedArgs pargs;
+  pargs.camera = DEFAULT_CAMERA_DEVICE;
 
-  int ret = parseArgs(argc, argv, model, camera, video, image, numFrames, headless, instrumented);
+  uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO | ARG_IMAGE |
+                   ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES;
+
+  int ret = parseArgs(argc, argv, flags,
+      "YOLOv8n 640x640 for i.MX 8M Plus — EdgeFirst Optimized", pargs);
   if (ret != 0) return ret > 0 ? 0 : 1;
 
-  if (model.empty()) {
+  if (pargs.model.empty()) {
     log_error("Provide model path with -m\n");
     return 1;
   }
 
   gst_init(&argc, &argv);
 
-  // Initialize HAL decoder — YOLOv8n combined [84, 8400] INT8 output
-  hal_decoder_params params = hal_decoder_params_default();
-  params.config_json =
-      "{\"outputs\":[{\"decoder\":\"ultralytics\","
-      "\"type\":\"detection\","
-      "\"shape\":[1,84,8400],"
-      "\"quantization\":[0.00390632,-128],"
-      "\"dshape\":[[\"batch\",1],[\"num_features\",84],[\"num_boxes\",8400]]}],"
-      "\"nms\":\"class_agnostic\"}";
-  params.score_threshold = CONF_THRESHOLD;
-  params.iou_threshold = NMS_IOU_THRESHOLD;
-  params.nms = HAL_NMS_CLASS_AGNOSTIC;
-
-  hal_decoder *decoder = hal_decoder_new(&params);
-  if (!decoder) {
-    log_error("Failed to create HAL decoder: %s\n", strerror(errno));
-    return 1;
-  }
-  log_info("HAL decoder: ultralytics detection [84,8400] INT8\n");
-
   // Letterbox
   LetterboxParams lb = calculateLetterbox(SOURCE_WIDTH, SOURCE_HEIGHT);
 
   log_info("YOLOv8n 640x640 for i.MX 8M Plus — EdgeFirst Optimized\n");
-  log_info("Model: %s\n", model.c_str());
-  if (!image.empty()) {
-    log_info("Input: image (%s)\n", image.c_str());
-  } else if (!video.empty()) {
-    log_info("Input: video (%s)\n", video.c_str());
+  log_info("Model: %s\n", pargs.model.c_str());
+  if (!pargs.image.empty()) {
+    log_info("Input: image (%s)\n", pargs.image.c_str());
+  } else if (!pargs.video.empty()) {
+    log_info("Input: video (%s)\n", pargs.video.c_str());
   } else {
-    log_info("Input: camera (%s)\n", camera.c_str());
+    log_info("Input: camera (%s)\n", pargs.camera.c_str());
   }
-  if (numFrames > 0) {
-    log_info("Frames: %d\n", numFrames);
+  if (pargs.numFrames > 0) {
+    log_info("Frames: %d\n", pargs.numFrames);
   }
-  log_info("Mode: %s\n", headless ? "headless" : "display");
+  log_info("Mode: %s\n", pargs.headless ? "headless" : "display");
   log_info("Framework: tensorflow2-lite (V2 invoke + DMA-BUF)\n");
   log_info("CameraAdaptor: rgba (NPU handles RGBA->RGB + UINT8->INT8)\n");
   log_info("Post-processing: EdgeFirst HAL (quantized NMS)\n");
@@ -577,35 +465,9 @@ int main(int argc, char **argv)
            lb.padX, lb.padRight, lb.padY, lb.padBottom);
 
   // Build EdgeFirst optimized pipeline
-  // Source element
-  std::string sourceStr;
-  if (!image.empty()) {
-    char *s = g_strdup_printf(
-        "filesrc location=%s ! jpegdec ! imxvideoconvert_g2d ! "
-        "video/x-raw,width=%d,height=%d ! imagefreeze",
-        image.c_str(), SOURCE_WIDTH, SOURCE_HEIGHT);
-    sourceStr = s;
-    g_free(s);
-  } else if (!video.empty()) {
-    char *s = g_strdup_printf(
-        "filesrc location=%s ! qtdemux ! h264parse ! v4l2h264dec",
-        video.c_str());
-    sourceStr = s;
-    g_free(s);
-  } else {
-    char *s;
-    if (numFrames > 0) {
-      s = g_strdup_printf(
-          "v4l2src device=%s num-buffers=%d ! video/x-raw,format=NV12,width=%d,height=%d,framerate=30/1",
-          camera.c_str(), numFrames, SOURCE_WIDTH, SOURCE_HEIGHT);
-    } else {
-      s = g_strdup_printf(
-          "v4l2src device=%s ! video/x-raw,format=NV12,width=%d,height=%d,framerate=30/1",
-          camera.c_str(), SOURCE_WIDTH, SOURCE_HEIGHT);
-    }
-    sourceStr = s;
-    g_free(s);
-  }
+  InputSource srcType = determineInputSource(pargs, false);
+  char *srcStr = buildSourceElement(srcType, pargs, SOURCE_WIDTH, SOURCE_HEIGHT,
+                                     (srcType == INPUT_CAMERA_V4L2) ? pargs.numFrames : 0);
 
   // NN branch (always present)
   char *nnBranch = g_strdup_printf(
@@ -616,14 +478,12 @@ int main(int argc, char **argv)
       "tensor_filter name=tfilter framework=tensorflow2-lite model=%s "
       "custom=Delegate:External,ExtDelegateLib:libvx_delegate.so,CameraAdaptor:rgba,DmaBuf:true latency=1 ! "
       "tensor_sink name=inferenceOutput",
-      MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, model.c_str());
+      MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, pargs.model.c_str());
 
   char *pipelineStr;
-  if (headless) {
-    // Headless: source -> NN branch only
-    pipelineStr = g_strdup_printf("%s ! %s", sourceStr.c_str(), nnBranch);
+  if (pargs.headless) {
+    pipelineStr = g_strdup_printf("%s ! %s", srcStr, nnBranch);
   } else {
-    // With display: tee -> NN branch + display branch
     pipelineStr = g_strdup_printf(
         "%s ! tee name=t "
         "t. ! %s "
@@ -631,9 +491,10 @@ int main(int argc, char **argv)
         "imxvideoconvert_g2d ! video/x-raw,format=RGBA ! "
         "cairooverlay name=cairo ! "
         "waylandsink sync=%s",
-        sourceStr.c_str(), nnBranch,
-        (!video.empty() || !image.empty()) ? "true" : "false");
+        srcStr, nnBranch,
+        (!pargs.video.empty() || !pargs.image.empty()) ? "true" : "false");
   }
+  g_free(srcStr);
   g_free(nnBranch);
 
   log_info("Pipeline: %s\n\n", pipelineStr);
@@ -641,9 +502,8 @@ int main(int argc, char **argv)
   // Initialize app
   AppData app = {};
   app.letterbox = lb;
-  app.headless = headless;
-  app.instrumented = instrumented;
-  app.decoder = decoder;
+  app.headless = pargs.headless;
+  app.instrumented = pargs.instrumented;
   app.timing.g2dScale.reset();
   app.timing.tensorConv.reset();
   app.timing.preprocTotal.reset();
@@ -651,12 +511,17 @@ int main(int argc, char **argv)
   app.timing.halDecode.reset();
   app.timing.postprocTotal.reset();
   app.timing.cairoDraw.reset();
-  app.timing.e2e.reset();
   app.timing.e2ePipeline.reset();
-  app.timing.firstFrame = true;
-  app.videoLoop = !video.empty() && image.empty();
-  app.startedOnce = false;
-  g_mutex_init(&app.timing.e2eMutex);
+  app.throughput.reset();
+  app.ptsTracker.init();
+
+  bool startedOnce = false;
+  app.busCtx.playing = &app.playing;
+  app.busCtx.startedOnce = &startedOnce;
+  app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
+  app.busCtx.videoRate = 1.0;
+  app.busCtx.printTiming = printTimingStatistics;
+  app.busCtx.appData = &app;
 
   // Create pipeline
   app.loop = g_main_loop_new(NULL, FALSE);
@@ -665,14 +530,16 @@ int main(int argc, char **argv)
 
   if (!app.gstPipeline) {
     log_error("Failed to create pipeline\n");
-    hal_decoder_free(decoder);
     return 1;
   }
+
+  app.busCtx.pipeline = app.gstPipeline;
+  app.busCtx.loop = app.loop;
 
   // Connect signals
   app.bus = gst_element_get_bus(app.gstPipeline);
   gst_bus_add_signal_watch(app.bus);
-  g_signal_connect(app.bus, "message", G_CALLBACK(busCallback), &app);
+  g_signal_connect(app.bus, "message", G_CALLBACK(commonBusCallback), &app.busCtx);
 
   GstElement *tsink = gst_bin_get_by_name(GST_BIN(app.gstPipeline), "inferenceOutput");
   g_signal_connect(tsink, "new-data", G_CALLBACK(newDataCallback), &app);
@@ -681,7 +548,7 @@ int main(int argc, char **argv)
   app.tensorFilter = gst_bin_get_by_name(GST_BIN(app.gstPipeline), "tfilter");
 
   // Connect cairo overlay for display mode
-  if (!headless) {
+  if (!pargs.headless) {
     GstElement *cairo = gst_bin_get_by_name(GST_BIN(app.gstPipeline), "cairo");
     if (cairo) {
       g_signal_connect(cairo, "draw", G_CALLBACK(drawCallback), &app);
@@ -715,7 +582,7 @@ int main(int argc, char **argv)
     gst_object_unref(tconv);
   }
 
-  g_unix_signal_add(SIGINT, sigintHandler, &app);
+  g_unix_signal_add(SIGINT, commonSigintHandler, &app.busCtx);
 
   // Run
   gst_element_set_state(app.gstPipeline, GST_STATE_PLAYING);
@@ -728,8 +595,9 @@ int main(int argc, char **argv)
   gst_object_unref(app.bus);
   gst_object_unref(app.gstPipeline);
   g_main_loop_unref(app.loop);
-  g_mutex_clear(&app.timing.e2eMutex);
-  hal_decoder_free(decoder);
+  app.ptsTracker.destroy();
+  if (app.decoder)
+    hal_decoder_free(app.decoder);
 
   return 0;
 }

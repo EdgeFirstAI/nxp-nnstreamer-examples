@@ -1,5 +1,6 @@
 /**
  * Copyright 2025 EdgeFirst AI (Au-Zone Technologies)
+ * Copyright 2026 EdgeFirst AI (Au-Zone Technologies)
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * YOLOv8n 640x640 Demo — Kinara Ara-2 NPU + EdgeFirst CameraAdaptor + HAL
@@ -13,7 +14,7 @@
  *   [1] boxes  — int16  [4, 8400]   (cx, cy, w, h in model pixel space)
  *
  * The HAL decoder handles all dequantization, shape matching, and NMS
- * internally based on an EdgeFirst YAML config file.
+ * internally based on inline configuration.
  *
  * PREPROCESSING (1 element — edgefirstcameraadaptor):
  *   - NV12 -> RGB color conversion (HAL)
@@ -34,7 +35,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <getopt.h>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -50,6 +50,15 @@
 #define NUM_OUTPUTS 2  /* scores + boxes tensors */
 #define DEFAULT_CAMERA_DEVICE "/dev/video3"
 
+// HAL JSON template — quantization filled from GstNnsTensorQuantMeta at runtime
+static const char *HAL_CONFIG_FMT =
+    "{\"outputs\":["
+    "{\"decoder\":\"ultralytics\",\"type\":\"scores\","
+    "\"shape\":[1,80,8400],\"quantization\":[%g,%" G_GINT64_FORMAT "],\"dtype\":\"uint8\"},"
+    "{\"decoder\":\"ultralytics\",\"type\":\"boxes\","
+    "\"shape\":[1,4,8400],\"quantization\":[%g,%" G_GINT64_FORMAT "],\"dtype\":\"int16\",\"signed\":true}"
+    "],\"nms\":\"class_agnostic\"}";
+
 
 /* --- Application data ---------------------------------------------------- */
 
@@ -59,13 +68,14 @@ struct AppData {
   GstBus *bus;
   gboolean playing;
 
+  // Common infrastructure
+  BusCallbackCtx busCtx;
+  ThroughputTracker throughput;
+
   TimingMetric preproc;
   TimingMetric inference;
   TimingMetric postproc;
-  TimingMetric e2e;
   struct timeval preprocStart;
-  struct timeval lastFrameTime;
-  bool firstFrame;
 
   int totalDetections;
   int framesWithDetections;
@@ -110,8 +120,10 @@ preprocEndProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
 
 /* --- Timing report ------------------------------------------------------- */
 
-static void printTiming(AppData *app)
+static void printTiming(void *userData)
 {
+  AppData *app = (AppData *)userData;
+
   printf("\n");
   printf("==============================================================================\n");
   printf("  KINARA ARA-2 NPU + EDGEFIRST CAMERAADAPTOR + HAL\n");
@@ -140,10 +152,10 @@ static void printTiming(AppData *app)
 
   printf("\n  END-TO-END\n");
   printf("  --------------------------------------------------------------------------\n");
-  if (app->e2e.count > 0) {
-    double avgMs = app->e2e.avg();
+  if (app->throughput.metric.count > 0) {
+    double avgMs = app->throughput.metric.avg();
     printf("     Average: %7.3f ms (%5.1f FPS)  |  Frames: %d\n",
-           avgMs, 1000.0 / avgMs, app->e2e.count);
+           avgMs, 1000.0 / avgMs, app->throughput.metric.count);
   }
 
   printf("\n  DETECTION STATISTICS\n");
@@ -158,43 +170,6 @@ static void printTiming(AppData *app)
 }
 
 
-/* --- GStreamer bus callback ----------------------------------------------- */
-
-static void busCallback(GstBus *, GstMessage *msg, gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  switch (GST_MESSAGE_TYPE(msg)) {
-    case GST_MESSAGE_ERROR: {
-      GError *err = NULL;
-      gchar *dbg = NULL;
-      gst_message_parse_error(msg, &err, &dbg);
-      g_printerr("\nERROR from %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
-      if (dbg) g_printerr("Debug: %s\n", dbg);
-      g_error_free(err);
-      g_free(dbg);
-      g_main_loop_quit(app->loop);
-      break;
-    }
-    case GST_MESSAGE_EOS:
-      gst_element_seek_simple(app->pipeline, GST_FORMAT_TIME,
-                              (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), 0);
-      break;
-    case GST_MESSAGE_STATE_CHANGED:
-      if (GST_MESSAGE_SRC(msg) == GST_OBJECT(app->pipeline)) {
-        GstState old_s, new_s, pending;
-        gst_message_parse_state_changed(msg, &old_s, &new_s, &pending);
-        g_print("Pipeline: %s -> %s\n",
-                gst_element_state_get_name(old_s),
-                gst_element_state_get_name(new_s));
-        app->playing = (new_s == GST_STATE_PLAYING);
-      }
-      break;
-    default:
-      break;
-  }
-}
-
-
 /* --- tensor_sink new-data callback --------------------------------------- */
 
 static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
@@ -205,7 +180,7 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   AppData *app = (AppData *)user_data;
 
   // Query letterbox from cameraadaptor on first frame (caps negotiated)
-  if (app->firstFrame && app->cameraadaptor) {
+  if (app->throughput.firstFrame && app->cameraadaptor) {
     gfloat scale = 0.0f;
     gint top = 0, left = 0;
     g_object_get(app->cameraadaptor, "letterbox-scale", &scale,
@@ -218,19 +193,10 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   }
 
   // Frame-to-frame interval
-  if (!app->firstFrame) {
-    app->e2e.record(timeDiffMs(app->lastFrameTime, startTime));
-  }
-  app->lastFrameTime = startTime;
-  app->firstFrame = false;
+  app->throughput.tick(startTime);
 
   // Inference latency
-  if (app->tensorFilter) {
-    gint64 latUs = 0;
-    g_object_get(app->tensorFilter, "latency", &latUs, NULL);
-    if (latUs > 0)
-      app->inference.record(latUs / 1000.0);
-  }
+  queryInferenceLatency(app->tensorFilter, app->inference);
 
   // Validate buffer — expect 2 memory blocks (scores + boxes)
   if (!GST_IS_BUFFER(buffer)) { g_printerr("ERROR: invalid buffer\n"); return; }
@@ -238,6 +204,36 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   if (n_mem != NUM_OUTPUTS) {
     g_printerr("ERROR: expected %d tensors, got %u\n", NUM_OUTPUTS, n_mem);
     return;
+  }
+
+  // Lazy HAL decoder init — extract quant params from GstNnsTensorQuantMeta
+  if (!app->decoder) {
+    QuantParams scores_qp, boxes_qp;
+    if (!extractQuantParams(buffer, 0, scores_qp) ||
+        !extractQuantParams(buffer, 1, boxes_qp)) {
+      g_printerr("ERROR: No quant meta — requires updated NNStreamer\n");
+      return;
+    }
+
+    gchar *json = g_strdup_printf(HAL_CONFIG_FMT,
+        scores_qp.scale, scores_qp.zeroPoint,
+        boxes_qp.scale, boxes_qp.zeroPoint);
+    hal_decoder_params params = hal_decoder_params_default();
+    params.config_json = json;
+    params.score_threshold = CONF_THRESHOLD;
+    params.iou_threshold = NMS_IOU_THRESHOLD;
+    params.nms = HAL_NMS_CLASS_AGNOSTIC;
+    app->decoder = hal_decoder_new(&params);
+    g_free(json);
+
+    if (!app->decoder) {
+      g_printerr("ERROR: HAL decoder creation failed\n");
+      return;
+    }
+
+    char *model_type = hal_decoder_model_type(app->decoder);
+    g_print("HAL decoder: type=%s\n", model_type ? model_type : "unknown");
+    free(model_type);
   }
 
   // Populate output tensor metadata on first frame.
@@ -369,7 +365,8 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
             float bw = (box.xmax - box.xmin) / app->letterbox.scale;
             float bh = (box.ymax - box.ymin) / app->letterbox.scale;
 
-            const char *name = (box.label < NUM_CLASSES) ? cocoClassNames[box.label] : "unknown";
+            const char *name = (box.label >= 0 && box.label < NUM_CLASSES)
+                ? cocoClassNames[box.label] : "unknown";
             g_print("  - %s (%.2f) at (%.0f,%.0f) %.0fx%.0f\n",
                     name, box.score, px, py, bw, bh);
           }
@@ -397,143 +394,32 @@ cleanup:
 }
 
 
-/* --- SIGINT handler ------------------------------------------------------ */
-
-static gboolean sigintHandler(gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  g_print("\nSIGINT — stopping.\n");
-  printTiming(app);
-  g_main_loop_quit(app->loop);
-  return TRUE;
-}
-
-
-/* --- Command line -------------------------------------------------------- */
-
-static int parseArgs(int argc, char **argv, std::string &model,
-                     std::string &camera, std::string &video,
-                     std::string &image, std::string &config,
-                     int &numFrames)
-{
-  static struct option long_opts[] = {
-    {"help",   no_argument,       0, 'h'},
-    {"model",  required_argument, 0, 'm'},
-    {"camera", required_argument, 0, 'd'},
-    {"video",  required_argument, 0, 'v'},
-    {"image",  required_argument, 0, 'i'},
-    {"config", required_argument, 0, 'c'},
-    {"frames", required_argument, 0, 'n'},
-    {0, 0, 0, 0}
-  };
-
-  int c;
-  while ((c = getopt_long(argc, argv, "hm:d:v:i:c:n:", long_opts, NULL)) != -1) {
-    switch (c) {
-      case 'h':
-        std::cout
-            << "YOLOv8n 640x640 for Kinara Ara-2 NPU — EdgeFirst CameraAdaptor + HAL\n\n"
-            << "Usage: " << argv[0] << " -m MODEL.dvm [-v VIDEO | -i IMAGE | -d CAMERA] [-c config.yaml] [-n FRAMES]\n\n"
-            << "Options:\n"
-            << "  -m, --model PATH    Path to YOLOv8n .dvm model [required]\n"
-            << "  -d, --camera DEVICE Camera device (default: " << DEFAULT_CAMERA_DEVICE << ")\n"
-            << "  -v, --video PATH    H.264 MP4 video input\n"
-            << "  -i, --image PATH    Static JPEG image input\n"
-            << "  -c, --config PATH   EdgeFirst YAML config (auto-detects edgefirst.yaml next to model)\n"
-            << "  -n, --frames N      Stop after N frames and print timing (0=infinite)\n"
-            << "  -h, --help          Show this help\n\n"
-            << "EdgeFirst optimizations:\n"
-            << "  * edgefirstcameraadaptor: fused NV12->int8 CHW preprocessing (HAL)\n"
-            << "  * Ara-2 NPU: native int8 CHW inference (no internal preprocessing)\n"
-            << "  * EdgeFirst HAL: quantized NMS (no CPU dequantization)\n";
-        return 1;
-      case 'm': model = optarg; break;
-      case 'd': camera = optarg; break;
-      case 'v': video = optarg; break;
-      case 'i': image = optarg; break;
-      case 'c': config = optarg; break;
-      case 'n': numFrames = atoi(optarg); break;
-    }
-  }
-  return 0;
-}
-
-
 /* --- Main ---------------------------------------------------------------- */
 
 int main(int argc, char **argv)
 {
-  std::string model, camera = DEFAULT_CAMERA_DEVICE, video, image, config;
-  int numFrames = 0;
-  if (parseArgs(argc, argv, model, camera, video, image, config, numFrames))
-    return 0;
+  ParsedArgs pargs;
+  pargs.camera = DEFAULT_CAMERA_DEVICE;
 
-  if (model.empty()) {
+  uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO | ARG_IMAGE | ARG_NUM_FRAMES;
+
+  int ret = parseArgs(argc, argv, flags,
+      "YOLOv8n 640x640 for Kinara Ara-2 NPU — EdgeFirst CameraAdaptor + HAL", pargs);
+  if (ret != 0) return ret > 0 ? 0 : 1;
+
+  if (pargs.model.empty()) {
     g_printerr("ERROR: provide model path with -m\n");
     return 1;
   }
 
   gst_init(&argc, &argv);
 
-  // Auto-detect edgefirst.yaml next to model when -c not provided
-  std::string config_path = config;
-  if (config_path.empty()) {
-    std::string model_dir = model.substr(0, model.find_last_of('/'));
-    if (model_dir == model)
-      model_dir = ".";
-    config_path = model_dir + "/edgefirst.yaml";
-    if (access(config_path.c_str(), R_OK) != 0) {
-      g_printerr("ERROR: no config file specified and edgefirst.yaml not found "
-                  "next to model.\nProvide -c /path/to/edgefirst.yaml\n");
-      return 1;
-    }
-    g_print("Auto-detected config: %s\n", config_path.c_str());
-  }
-
-  // Initialize HAL decoder
-  hal_decoder_params params = hal_decoder_params_default();
-  params.config_file = config_path.c_str();
-  params.score_threshold = CONF_THRESHOLD;
-  params.iou_threshold = NMS_IOU_THRESHOLD;
-  params.nms = HAL_NMS_CLASS_AGNOSTIC;
-
-  hal_decoder *decoder = hal_decoder_new(&params);
-  if (!decoder) {
-    g_printerr("ERROR: failed to create HAL decoder: %s\n", strerror(errno));
-    return 1;
-  }
-
-  char *model_type = hal_decoder_model_type(decoder);
-  g_print("HAL decoder: type=%s\n", model_type ? model_type : "unknown");
-  free(model_type);
-
-  // Letterbox params will be queried from cameraadaptor after caps negotiation
-
   // Build source element
-  std::string sourceStr;
-  if (!image.empty()) {
-    char *s = g_strdup_printf(
-        "filesrc location=%s ! jpegdec ! imxvideoconvert_g2d ! "
-        "video/x-raw,width=%d,height=%d ! imagefreeze",
-        image.c_str(), SOURCE_WIDTH, SOURCE_HEIGHT);
-    sourceStr = s;
-    g_free(s);
-    g_print("Input: image (%s)\n", image.c_str());
-  } else if (!video.empty()) {
-    char *s = g_strdup_printf(
-        "filesrc location=%s ! qtdemux ! h264parse ! v4l2h264dec",
-        video.c_str());
-    sourceStr = s;
-    g_free(s);
-    g_print("Input: video (%s)\n", video.c_str());
-  } else {
-    char *s = g_strdup_printf(
-        "v4l2src device=%s ! video/x-raw,format=NV12,width=%d,height=%d,framerate=30/1",
-        camera.c_str(), SOURCE_WIDTH, SOURCE_HEIGHT);
-    sourceStr = s;
-    g_free(s);
-    g_print("Input: camera (%s)\n", camera.c_str());
-  }
+  InputSource srcType = determineInputSource(pargs, false);
+  char *srcStr = buildSourceElement(srcType, pargs);
+  g_print("Input: %s\n",
+          srcType == INPUT_IMAGE ? pargs.image.c_str() :
+          srcType == INPUT_VIDEO ? pargs.video.c_str() : pargs.camera.c_str());
 
   // Pipeline: source → cameraadaptor → ara2 → tensor_sink
   gchar *pipelineStr = g_strdup_printf(
@@ -544,23 +430,22 @@ int main(int argc, char **argv)
       "tensor_filter name=tfilter framework=ara2 model=%s "
       "custom=EnableStats:true latency=1 ! "
       "tensor_sink name=inferenceOutput",
-      sourceStr.c_str(),
+      srcStr,
       MODEL_INPUT_SIZE, MODEL_INPUT_SIZE,
-      model.c_str());
+      pargs.model.c_str());
+  g_free(srcStr);
 
   g_print("Pipeline:\n%s\n\n", pipelineStr);
 
-  if (numFrames > 0)
-    g_print("Frames: %d\n", numFrames);
+  if (pargs.numFrames > 0)
+    g_print("Frames: %d\n", pargs.numFrames);
 
   AppData app = {};
-  app.decoder = decoder;
-  app.maxFrames = numFrames;
+  app.maxFrames = pargs.numFrames;
   app.preproc.reset();
   app.inference.reset();
   app.postproc.reset();
-  app.e2e.reset();
-  app.firstFrame = true;
+  app.throughput.reset();
 
   app.loop = g_main_loop_new(NULL, FALSE);
   app.pipeline = gst_parse_launch(pipelineStr, NULL);
@@ -568,21 +453,30 @@ int main(int argc, char **argv)
 
   if (!app.pipeline) {
     g_printerr("ERROR: failed to create pipeline\n");
-    hal_decoder_free(decoder);
     return 1;
   }
+
+  // Configure common bus callback
+  app.busCtx.pipeline = app.pipeline;
+  app.busCtx.loop = app.loop;
+  app.busCtx.playing = &app.playing;
+  app.busCtx.startedOnce = NULL;  // No state-change suppression
+  app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
+  app.busCtx.videoRate = 1.0;
+  app.busCtx.printTiming = printTiming;
+  app.busCtx.appData = &app;
 
   // Bus
   app.bus = gst_element_get_bus(app.pipeline);
   gst_bus_add_signal_watch(app.bus);
-  g_signal_connect(app.bus, "message", G_CALLBACK(busCallback), &app);
+  g_signal_connect(app.bus, "message", G_CALLBACK(commonBusCallback), &app.busCtx);
 
   // tensor_sink
   GstElement *tsink = gst_bin_get_by_name(GST_BIN(app.pipeline), "inferenceOutput");
   g_signal_connect(tsink, "new-data", G_CALLBACK(newDataCallback), &app);
   gst_object_unref(tsink);
 
-  // tensor_filter for latency
+  // tensor_filter for latency query
   app.tensorFilter = gst_bin_get_by_name(GST_BIN(app.pipeline), "tfilter");
 
   // Preprocessing timing probes (cameraadaptor sink → src)
@@ -600,9 +494,9 @@ int main(int argc, char **argv)
     }
   }
 
-  g_unix_signal_add(SIGINT, sigintHandler, &app);
+  g_unix_signal_add(SIGINT, commonSigintHandler, &app.busCtx);
 
-  // Run — letterbox params are queried from cameraadaptor on first frame
+  // Run
   gst_element_set_state(app.pipeline, GST_STATE_PLAYING);
   g_main_loop_run(app.loop);
 
@@ -615,7 +509,8 @@ int main(int argc, char **argv)
   gst_object_unref(app.bus);
   gst_object_unref(app.pipeline);
   g_main_loop_unref(app.loop);
-  hal_decoder_free(decoder);
+  if (app.decoder)
+    hal_decoder_free(app.decoder);
 
   return 0;
 }
