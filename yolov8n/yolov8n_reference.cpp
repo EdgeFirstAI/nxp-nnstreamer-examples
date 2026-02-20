@@ -104,9 +104,8 @@ typedef struct {
   // Rendering
   TimingMetric cairoDraw;      // Cairo rendering
 
-  // End-to-end
-  TimingMetric e2e;            // Frame-to-frame interval (throughput)
-  TimingMetric e2ePipeline;    // True E2E latency (PTS-correlated)
+  // End-to-end (PTS-correlated)
+  TimingMetric e2ePipeline;
 
   // Timestamps for pad probe timing
   struct timeval g2dStart;
@@ -116,12 +115,6 @@ typedef struct {
   struct timeval tensorconvEnd;
   struct timeval tshift1End;
   struct timeval tshift2End;
-  struct timeval lastFrameTime;
-  bool firstFrame;
-
-  // PTS-correlated E2E tracking
-  std::map<GstClockTime, struct timeval> nnPipelineStart;
-  GMutex e2eMutex;
 
   // Detection statistics
   int totalDetections;
@@ -145,9 +138,17 @@ typedef struct {
   LetterboxParams letterbox;
   Platform platform;
   bool headless;
-  bool videoLoop;   // Loop video on EOS
-  double videoRate; // Playback rate (1.0 = normal, 0.5 = half speed)
-  bool startedOnce; // Suppress repeated state change messages after initial startup
+
+  // Quantization parameters (from GstNnsTensorQuantMeta)
+  double quantScale;
+  int64_t quantZeroPoint;
+  int quantizedThreshold;
+  bool quantInitialized = false;
+
+  // Common infrastructure
+  BusCallbackCtx busCtx;
+  ThroughputTracker throughput;
+  PtsTracker ptsTracker;
 } AppData;
 
 
@@ -160,16 +161,7 @@ static GstPadProbeReturn g2dSinkProbe(GstPad *, GstPadProbeInfo *info, gpointer 
 
   // Store timestamp keyed by PTS for E2E correlation
   GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-  if (buffer) {
-    GstClockTime pts = GST_BUFFER_PTS(buffer);
-    if (GST_CLOCK_TIME_IS_VALID(pts)) {
-      g_mutex_lock(&app->timing.e2eMutex);
-      app->timing.nnPipelineStart[pts] = app->timing.g2dStart;
-      while (app->timing.nnPipelineStart.size() > 100)
-        app->timing.nnPipelineStart.erase(app->timing.nnPipelineStart.begin());
-      g_mutex_unlock(&app->timing.e2eMutex);
-    }
-  }
+  app->ptsTracker.recordStart(buffer, app->timing.g2dStart);
   return GST_PAD_PROBE_OK;
 }
 
@@ -225,8 +217,9 @@ static GstPadProbeReturn tshift2SrcProbe(GstPad *, GstPadProbeInfo *, gpointer u
 
 /* ─── Timing report ───────────────────────────────────────────────── */
 
-static void printTimingStatistics(AppData *app)
+static void printTimingStatistics(void *userData)
 {
+  AppData *app = (AppData *)userData;
   const PlatformConfig &plat = platformConfigs[app->platform];
 
   printf("\n");
@@ -338,12 +331,12 @@ static void printTimingStatistics(AppData *app)
     printf("     Coverage: %6.1f%%\n", coverage);
   }
 
-  if (app->timing.e2e.count > 0) {
-    double avgMs = app->timing.e2e.avg();
+  if (app->throughput.metric.count > 0) {
+    double avgMs = app->throughput.metric.avg();
     printf("\n  4. Frame Throughput\n");
     printf("     Average: %7.3f ms (%5.1f FPS)  |  Min: %7.3f ms  |  Max: %7.3f ms\n",
-           avgMs, 1000.0 / avgMs, app->timing.e2e.minMs, app->timing.e2e.maxMs);
-    printf("     Frames: %d\n", app->timing.e2e.count);
+           avgMs, 1000.0 / avgMs, app->throughput.metric.minMs, app->throughput.metric.maxMs);
+    printf("     Frames: %d\n", app->throughput.metric.count);
   }
 
   printf("\n==============================================================================\n");
@@ -365,70 +358,6 @@ static void printTimingStatistics(AppData *app)
 
 /* ─── GStreamer callbacks ─────────────────────────────────────────── */
 
-static gboolean sigintHandler(gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  log_info("SIGINT — stopping.\n");
-  printTimingStatistics(app);
-  g_main_loop_quit(app->loop);
-  return TRUE;
-}
-
-static void busCallback(GstBus *, GstMessage *message, gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  switch (GST_MESSAGE_TYPE(message)) {
-    case GST_MESSAGE_ERROR: {
-      GError *err;
-      gchar *debugInfo;
-      gst_message_parse_error(message, &err, &debugInfo);
-      log_error("Error from %s: %s\n", GST_OBJECT_NAME(message->src), err->message);
-      log_debug("Debug: %s\n", debugInfo ? debugInfo : "none");
-      g_error_free(err);
-      g_free(debugInfo);
-      g_main_loop_quit(app->loop);
-      break;
-    }
-    case GST_MESSAGE_EOS:
-      if (app->videoLoop) {
-        gst_element_seek(app->gstPipeline, app->videoRate, GST_FORMAT_TIME,
-                         (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
-                         GST_SEEK_TYPE_SET, 0, GST_SEEK_TYPE_NONE, 0);
-      } else {
-        log_info("End-Of-Stream reached.\n");
-        printTimingStatistics(app);
-        g_main_loop_quit(app->loop);
-      }
-      break;
-    case GST_MESSAGE_STATE_CHANGED: {
-      GstState oldState, newState, pendingState;
-      gst_message_parse_state_changed(message, &oldState, &newState, &pendingState);
-      if (GST_MESSAGE_SRC(message) == GST_OBJECT(app->gstPipeline) &&
-          oldState != newState) {
-        if (!app->startedOnce) {
-          log_info("Pipeline state: %s -> %s\n",
-                   gst_element_state_get_name(oldState),
-                   gst_element_state_get_name(newState));
-        }
-        if (newState == GST_STATE_PLAYING) {
-          app->playing = true;
-          if (!app->startedOnce && app->videoRate != 1.0) {
-            gst_element_seek(app->gstPipeline, app->videoRate, GST_FORMAT_TIME,
-                             (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
-                             GST_SEEK_TYPE_SET, 0, GST_SEEK_TYPE_NONE, 0);
-          }
-          app->startedOnce = true;
-        } else {
-          app->playing = false;
-        }
-      }
-      break;
-    }
-    default:
-      break;
-  }
-}
-
 static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
 {
   struct timeval callbackStart, mmapEnd, dequantEnd, nmsEnd;
@@ -437,19 +366,10 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   AppData *app = (AppData *)user_data;
 
   // Frame-to-frame interval
-  if (!app->timing.firstFrame) {
-    app->timing.e2e.record(timeDiffMs(app->timing.lastFrameTime, callbackStart));
-  }
-  app->timing.lastFrameTime = callbackStart;
-  app->timing.firstFrame = false;
+  app->throughput.tick(callbackStart);
 
   // Inference latency from tensor_filter
-  if (app->tensorFilter) {
-    gint64 latencyUs = 0;
-    g_object_get(app->tensorFilter, "latency", &latencyUs, NULL);
-    if (latencyUs > 0)
-      app->timing.inference.record(latencyUs / 1000.0);
-  }
+  queryInferenceLatency(app->tensorFilter, app->timing.inference);
 
   // Validate buffer
   if (!GST_IS_BUFFER(buffer)) { log_error("Invalid buffer\n"); return; }
@@ -467,6 +387,23 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   gettimeofday(&mmapEnd, NULL);
   app->timing.outputMmap.record(timeDiffMs(callbackStart, mmapEnd));
 
+  // Extract quantization parameters from GstNnsTensorQuantMeta on first frame
+  if (!app->quantInitialized) {
+    QuantParams qp;
+    if (!extractQuantParams(buffer, 0, qp)) {
+      log_error("No quant meta — requires updated NNStreamer\n");
+      gst_memory_unmap(mem, &info);
+      return;
+    }
+    app->quantScale = qp.scale;
+    app->quantZeroPoint = qp.zeroPoint;
+    app->quantizedThreshold =
+        static_cast<int>((CONF_THRESHOLD / qp.scale) + qp.zeroPoint);
+    log_info("Quant meta: scale=%g zero_point=%" G_GINT64_FORMAT "\n",
+             qp.scale, qp.zeroPoint);
+    app->quantInitialized = true;
+  }
+
   // Dequantization + box extraction
   std::vector<DetectedObject> output;
   for (int bIdx = 0; bIdx < NUM_TOTAL_BOXES; ++bIdx) {
@@ -479,16 +416,16 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
         maxClassIdx = cIdx;
       }
     }
-    if (maxClassConfVal > QUANTIZED_THRESHOLD) {
+    if (maxClassConfVal > app->quantizedThreshold) {
       int8_t raw_cx = outputTensor[0 * NUM_TOTAL_BOXES + bIdx];
       int8_t raw_cy = outputTensor[1 * NUM_TOTAL_BOXES + bIdx];
       int8_t raw_w  = outputTensor[2 * NUM_TOTAL_BOXES + bIdx];
       int8_t raw_h  = outputTensor[3 * NUM_TOTAL_BOXES + bIdx];
 
-      float cx = (raw_cx - ZERO_POINT) * SCALE_FACTOR;
-      float cy = (raw_cy - ZERO_POINT) * SCALE_FACTOR;
-      float w  = (raw_w  - ZERO_POINT) * SCALE_FACTOR;
-      float h  = (raw_h  - ZERO_POINT) * SCALE_FACTOR;
+      float cx = (raw_cx - app->quantZeroPoint) * app->quantScale;
+      float cy = (raw_cy - app->quantZeroPoint) * app->quantScale;
+      float w  = (raw_w  - app->quantZeroPoint) * app->quantScale;
+      float h  = (raw_h  - app->quantZeroPoint) * app->quantScale;
 
       // Model output normalized [0,1] → pixel coords → remove letterbox → scale to source
       float px = cx * MODEL_INPUT_SIZE - app->letterbox.padX;
@@ -510,7 +447,7 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
       if (object.x + object.width > SOURCE_WIDTH || object.y + object.height > SOURCE_HEIGHT) continue;
 
       object.classId = maxClassIdx - NUM_COORDINATES;
-      object.prob = (maxClassConfVal - ZERO_POINT) * SCALE_FACTOR;
+      object.prob = (maxClassConfVal - app->quantZeroPoint) * app->quantScale;
       object.valid = true;
       output.push_back(object);
     }
@@ -553,15 +490,9 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   app->timing.postprocTotal.record(timeDiffMs(callbackStart, nmsEnd));
 
   // PTS-correlated E2E
-  GstClockTime pts = GST_BUFFER_PTS(buffer);
-  if (GST_CLOCK_TIME_IS_VALID(pts)) {
-    g_mutex_lock(&app->timing.e2eMutex);
-    auto it = app->timing.nnPipelineStart.find(pts);
-    if (it != app->timing.nnPipelineStart.end()) {
-      app->timing.e2ePipeline.record(timeDiffMs(it->second, nmsEnd));
-      app->timing.nnPipelineStart.erase(it);
-    }
-    g_mutex_unlock(&app->timing.e2eMutex);
+  struct timeval ptsStart;
+  if (app->ptsTracker.consumeStart(buffer, ptsStart)) {
+    app->timing.e2ePipeline.record(timeDiffMs(ptsStart, nmsEnd));
   }
 }
 
@@ -601,7 +532,7 @@ static void drawCallback(GstElement *, cairo_t *cr, guint64, guint64, gpointer u
   }
 
   // Draw timing overlay in top-left corner
-  double fps = app->timing.e2e.count > 0 ? 1000.0 / app->timing.e2e.avg() : 0;
+  double fps = app->throughput.metric.count > 0 ? 1000.0 / app->throughput.metric.avg() : 0;
   double infMs = app->timing.inference.avg();
   double prepMs = app->timing.preprocTotal.avg();
   int nDet = (int)app->results.size();
@@ -631,69 +562,35 @@ static void drawCallback(GstElement *, cairo_t *cr, guint64, guint64, gpointer u
 
 /* ─── Pipeline construction ───────────────────────────────────────── */
 
-static char *buildPipeline(Platform platform, const std::string &model,
-                           const std::string &camera, const std::string &video,
-                           const std::string &image, const LetterboxParams &lb, bool headless)
+static char *buildPipeline(Platform platform, const ParsedArgs &pargs,
+                           const LetterboxParams &lb, bool headless)
 {
   const PlatformConfig &plat = platformConfigs[platform];
 
   // Source element
+  InputSource srcType = determineInputSource(pargs, plat.usesLibcamerasrc);
+  char *srcStr = buildSourceElement(srcType, pargs);
+
+  // For display mode, wrap source with tee (except headless)
   std::string source;
-  if (!image.empty()) {
-    // Static image input — use imagefreeze to create continuous stream
-    char *s;
-    if (headless) {
-      s = g_strdup_printf(
-          "filesrc location=%s ! jpegdec ! imxvideoconvert_g2d ! "
-          "video/x-raw,width=%d,height=%d ! imagefreeze ! "
-          "queue name=thread-nn leaky=2 max-size-buffers=2",
-          image.c_str(), SOURCE_WIDTH, SOURCE_HEIGHT);
+  if (headless || srcType == INPUT_IMAGE) {
+    if (!headless && srcType == INPUT_IMAGE) {
+      char *s = g_strdup_printf("%s ! tee name=t "
+          "t. ! queue name=thread-nn leaky=2 max-size-buffers=2", srcStr);
+      source = s;
+      g_free(s);
     } else {
-      s = g_strdup_printf(
-          "filesrc location=%s ! jpegdec ! imxvideoconvert_g2d ! "
-          "video/x-raw,width=%d,height=%d ! imagefreeze ! "
-          "tee name=t "
-          "t. ! queue name=thread-nn leaky=2 max-size-buffers=2",
-          image.c_str(), SOURCE_WIDTH, SOURCE_HEIGHT);
+      char *s = g_strdup_printf("%s ! queue name=thread-nn leaky=2 max-size-buffers=2", srcStr);
+      source = s;
+      g_free(s);
     }
-    source = s;
-    g_free(s);
-  } else if (!video.empty()) {
-    // Video file input — use tee for display branch unless headless
-    char *s;
-    if (headless) {
-      s = g_strdup_printf(
-          "filesrc location=%s ! qtdemux ! h264parse ! v4l2h264dec ! "
-          "queue name=thread-nn leaky=2 max-size-buffers=2",
-          video.c_str());
-    } else {
-      s = g_strdup_printf(
-          "filesrc location=%s ! qtdemux ! h264parse ! v4l2h264dec ! "
-          "tee name=t "
-          "t. ! queue name=thread-nn leaky=2 max-size-buffers=2",
-          video.c_str());
-    }
-    source = s;
-    g_free(s);
-  } else if (plat.usesLibcamerasrc) {
-    // i.MX 95 camera
-    char *s = g_strdup_printf(
-        "libcamerasrc ! video/x-raw,format=NV12,width=%d,height=%d ! "
-        "tee name=t "
-        "t. ! queue name=thread-nn leaky=2 max-size-buffers=2",
-        SOURCE_WIDTH, SOURCE_HEIGHT);
-    source = s;
-    g_free(s);
   } else {
-    // i.MX 8M Plus camera
-    char *s = g_strdup_printf(
-        "v4l2src device=%s ! video/x-raw,format=NV12,width=%d,height=%d,framerate=30/1 ! "
-        "tee name=t "
-        "t. ! queue name=thread-nn leaky=2 max-size-buffers=2",
-        camera.c_str(), SOURCE_WIDTH, SOURCE_HEIGHT);
+    char *s = g_strdup_printf("%s ! tee name=t "
+        "t. ! queue name=thread-nn leaky=2 max-size-buffers=2", srcStr);
     source = s;
     g_free(s);
   }
+  g_free(srcStr);
 
   // NN branch: preprocessing + inference + sink
   char *nnBranch = g_strdup_printf(
@@ -710,7 +607,7 @@ static char *buildPipeline(Platform platform, const std::string &model,
       source.c_str(),
       lb.scaledW, lb.scaledH,
       -lb.padX, -lb.padRight, -lb.padY, -lb.padBottom,
-      model.c_str(), plat.delegateLib);
+      pargs.model.c_str(), plat.delegateLib);
 
   char *pipeline;
   if (headless) {
@@ -724,7 +621,7 @@ static char *buildPipeline(Platform platform, const std::string &model,
         "imxvideoconvert_g2d ! "
         "cairooverlay name=cairo ! "
         "waylandsink sync=%s",
-        nnBranch, (!video.empty()) ? "true" : "false");
+        nnBranch, (!pargs.video.empty() || !pargs.image.empty()) ? "true" : "false");
     g_free(nnBranch);
   }
 
@@ -766,90 +663,41 @@ static void installProbes(GstElement *pipeline, AppData *app)
 }
 
 
-/* ─── Command line parsing ────────────────────────────────────────── */
-
-static int parseArgs(int argc, char **argv, std::string &model, std::string &camera,
-                     std::string &video, std::string &image, Platform &platform, bool &headless,
-                     int &numFrames, double &speed)
-{
-  static struct option longOptions[] = {
-    {"help",     no_argument,       0, 'h'},
-    {"model",    required_argument, 0, 'm'},
-    {"camera",   required_argument, 0, 'c'},
-    {"video",    required_argument, 0, 'v'},
-    {"image",    required_argument, 0, 'i'},
-    {"headless", no_argument,       0, 'H'},
-    {"frames",   required_argument, 0, 'n'},
-    {"platform", required_argument, 0, 'p'},
-    {"speed",    required_argument, 0, 's'},
-    {0, 0, 0, 0}
-  };
-
-  int c;
-  while ((c = getopt_long(argc, argv, "hm:c:v:i:Hn:p:s:", longOptions, NULL)) != -1) {
-    switch (c) {
-      case 'h':
-        std::cout
-            << "YOLOv8n 640x640 Reference Pipeline (standard NXP preprocessing)\n\n"
-            << "Usage: " << argv[0] << " -m MODEL --platform imx95|imx8mp [options]\n\n"
-            << "Options:\n"
-            << "  -m, --model PATH      Model file (.tflite) [required]\n"
-            << "  -p, --platform NAME   Platform: imx95 or imx8mp [required]\n"
-            << "  -c, --camera DEVICE   Camera device (default: platform-specific)\n"
-            << "  -v, --video FILE      Video file input (H.264 MP4)\n"
-            << "  -i, --image FILE      Static image input (JPEG)\n"
-            << "  -s, --speed RATE      Video playback speed (0.25=quarter, 0.5=half, 1.0=normal)\n"
-            << "  -H, --headless        No display output\n"
-            << "  -n, --frames N        Stop after N frames (0=infinite, default=0)\n"
-            << "  -h, --help            Show this help\n";
-        return 1;
-      case 'm': model = optarg; break;
-      case 'c': camera = optarg; break;
-      case 'v': video = optarg; break;
-      case 'i': image = optarg; break;
-      case 'H': headless = true; break;
-      case 'n': numFrames = atoi(optarg); break;
-      case 's': speed = atof(optarg); break;
-      case 'p':
-        if (strcmp(optarg, "imx95") == 0)
-          platform = PLATFORM_IMX95;
-        else if (strcmp(optarg, "imx8mp") == 0)
-          platform = PLATFORM_IMX8MP;
-        else {
-          std::cerr << "Unknown platform: " << optarg << " (use imx95 or imx8mp)\n";
-          return -1;
-        }
-        break;
-    }
-  }
-  return 0;
-}
-
-
 /* ─── Main ────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
 {
-  std::string model, camera, video, image;
-  Platform platform = PLATFORM_IMX8MP;
-  bool headless = false;
-  int numFrames = 0;
-  double speed = 1.0;
-  bool platformSet = false;
+  ParsedArgs pargs;
+  pargs.camera = "";  // Will be set from platform default
 
-  // Check if --platform was provided
-  for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--platform") == 0 || strcmp(argv[i], "-p") == 0)
-      platformSet = true;
-  }
+  uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO | ARG_IMAGE |
+                   ARG_HEADLESS | ARG_NUM_FRAMES | ARG_PLATFORM | ARG_SPEED;
 
-  int ret = parseArgs(argc, argv, model, camera, video, image, platform, headless, numFrames, speed);
+  int ret = parseArgs(argc, argv, flags,
+      "YOLOv8n 640x640 Reference Pipeline (standard NXP preprocessing)", pargs);
   if (ret != 0) return ret > 0 ? 0 : 1;
 
-  if (model.empty()) {
+  if (pargs.model.empty()) {
     log_error("Provide model path with -m\n");
     return 1;
   }
+
+  // Parse platform
+  Platform platform = PLATFORM_IMX8MP;
+  bool platformSet = false;
+  if (!pargs.platformStr.empty()) {
+    if (pargs.platformStr == "imx95") {
+      platform = PLATFORM_IMX95;
+      platformSet = true;
+    } else if (pargs.platformStr == "imx8mp") {
+      platform = PLATFORM_IMX8MP;
+      platformSet = true;
+    } else {
+      log_error("Unknown platform: %s (use imx95 or imx8mp)\n", pargs.platformStr.c_str());
+      return 1;
+    }
+  }
+
   if (!platformSet) {
     log_error("Provide platform with --platform imx95 or --platform imx8mp\n");
     return 1;
@@ -858,37 +706,27 @@ int main(int argc, char **argv)
   const PlatformConfig &plat = platformConfigs[platform];
 
   // Set default camera if not specified
-  if (camera.empty() && plat.defaultCamera)
-    camera = plat.defaultCamera;
+  if (pargs.camera.empty() && plat.defaultCamera)
+    pargs.camera = plat.defaultCamera;
 
   // Platform-specific environment setup
-  if (platform == PLATFORM_IMX95) {
-    const char *pm = getenv("LIBCAMERA_PIPELINES_MATCH_LIST");
-    if (!pm || strlen(pm) == 0) {
-      log_info("Setting LIBCAMERA_PIPELINES_MATCH_LIST='nxp/neo,imx8-isi'\n");
-      setenv("LIBCAMERA_PIPELINES_MATCH_LIST", "nxp/neo,imx8-isi", 1);
-    }
-    const char *zc = getenv("NEUTRON_ENABLE_ZERO_COPY");
-    if (!zc) {
-      log_info("Setting NEUTRON_ENABLE_ZERO_COPY=0\n");
-      setenv("NEUTRON_ENABLE_ZERO_COPY", "0", 1);
-    }
-  }
+  if (platform == PLATFORM_IMX95)
+    setupImx95Environment();
 
   log_info("YOLOv8n 640x640 Reference Pipeline — %s (%s)\n", plat.name, plat.npuName);
-  log_info("Model: %s\n", model.c_str());
+  log_info("Model: %s\n", pargs.model.c_str());
   log_info("Delegate: %s\n", plat.delegateLib);
-  if (!image.empty()) {
-    log_info("Input: image (%s)\n", image.c_str());
-  } else if (!video.empty()) {
-    log_info("Input: video (%s)\n", video.c_str());
-    if (speed != 1.0) {
-      log_info("Playback speed: %.2fx\n", speed);
+  if (!pargs.image.empty()) {
+    log_info("Input: image (%s)\n", pargs.image.c_str());
+  } else if (!pargs.video.empty()) {
+    log_info("Input: video (%s)\n", pargs.video.c_str());
+    if (pargs.speed != 1.0) {
+      log_info("Playback speed: %.2fx\n", pargs.speed);
     }
   } else {
-    log_info("Input: camera (%s)\n", camera.empty() ? "libcamerasrc" : camera.c_str());
+    log_info("Input: camera (%s)\n", pargs.camera.empty() ? "libcamerasrc" : pargs.camera.c_str());
   }
-  if (headless) {
+  if (pargs.headless) {
     log_info("Mode: headless (no display)\n");
   }
 
@@ -901,7 +739,7 @@ int main(int argc, char **argv)
            lb.padX, lb.padRight, lb.padY, lb.padBottom);
 
   // Build pipeline
-  char *pipelineStr = buildPipeline(platform, model, camera, video, image, lb, headless);
+  char *pipelineStr = buildPipeline(platform, pargs, lb, pargs.headless);
   log_info("Pipeline: %s\n\n", pipelineStr);
 
   // Initialize app data
@@ -909,10 +747,8 @@ int main(int argc, char **argv)
   app.className = getCocoClassNames();
   app.letterbox = lb;
   app.platform = platform;
-  app.headless = headless;
-  app.videoLoop = !video.empty() && image.empty();  // Don't loop for image input
-  app.videoRate = speed;
-  app.startedOnce = false;
+  app.headless = pargs.headless;
+
   app.timing.g2dScale.reset();
   app.timing.letterbox.reset();
   app.timing.colorconv.reset();
@@ -926,10 +762,21 @@ int main(int argc, char **argv)
   app.timing.nms.reset();
   app.timing.postprocTotal.reset();
   app.timing.cairoDraw.reset();
-  app.timing.e2e.reset();
   app.timing.e2ePipeline.reset();
-  app.timing.firstFrame = true;
-  g_mutex_init(&app.timing.e2eMutex);
+
+  app.throughput.reset();
+  app.ptsTracker.init();
+
+  // Setup bus callback context
+  bool startedOnce = false;
+  app.busCtx.pipeline = NULL;  // Set after pipeline creation
+  app.busCtx.loop = NULL;
+  app.busCtx.playing = &app.playing;
+  app.busCtx.startedOnce = &startedOnce;
+  app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
+  app.busCtx.videoRate = pargs.speed;
+  app.busCtx.printTiming = printTimingStatistics;
+  app.busCtx.appData = &app;
 
   // Create pipeline
   app.loop = g_main_loop_new(NULL, FALSE);
@@ -941,17 +788,20 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  app.busCtx.pipeline = app.gstPipeline;
+  app.busCtx.loop = app.loop;
+
   // Connect signals
   app.bus = gst_element_get_bus(app.gstPipeline);
   gst_bus_add_signal_watch(app.bus);
-  g_signal_connect(app.bus, "message", G_CALLBACK(busCallback), &app);
+  g_signal_connect(app.bus, "message", G_CALLBACK(commonBusCallback), &app.busCtx);
 
   GstElement *tsink = gst_bin_get_by_name(GST_BIN(app.gstPipeline), "inferenceOutput");
   g_signal_connect(tsink, "new-data", G_CALLBACK(newDataCallback), &app);
   gst_object_unref(tsink);
 
   // Cairo overlay (only when displaying)
-  if (!headless) {
+  if (!pargs.headless) {
     GstElement *cairo = gst_bin_get_by_name(GST_BIN(app.gstPipeline), "cairo");
     if (cairo) {
       g_signal_connect(cairo, "draw", G_CALLBACK(drawCallback), &app);
@@ -965,7 +815,7 @@ int main(int argc, char **argv)
   installProbes(app.gstPipeline, &app);
 
   // SIGINT handler
-  g_unix_signal_add(SIGINT, sigintHandler, &app);
+  g_unix_signal_add(SIGINT, commonSigintHandler, &app.busCtx);
 
   // Run
   gst_element_set_state(app.gstPipeline, GST_STATE_PLAYING);
@@ -978,7 +828,7 @@ int main(int argc, char **argv)
   gst_object_unref(app.bus);
   gst_object_unref(app.gstPipeline);
   g_main_loop_unref(app.loop);
-  g_mutex_clear(&app.timing.e2eMutex);
+  app.ptsTracker.destroy();
 
   return 0;
 }

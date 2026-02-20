@@ -13,6 +13,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0)
 pkg_check_modules(GST_ALLOC REQUIRED gstreamer-allocators-1.0)
 pkg_check_modules(CAIRO REQUIRED cairo)
+pkg_check_modules(NNSTREAMER REQUIRED nnstreamer)
 find_package(OpenMP REQUIRED)
 
 # Include directories
@@ -20,6 +21,7 @@ include_directories(
   ${GSTREAMER_INCLUDE_DIRS}
   ${GST_ALLOC_INCLUDE_DIRS}
   ${CAIRO_INCLUDE_DIRS}
+  ${NNSTREAMER_INCLUDE_DIRS}
   ${CMAKE_CURRENT_SOURCE_DIR}/common
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/cpp/include
 )
@@ -28,6 +30,7 @@ link_directories(
   ${GSTREAMER_LIBRARY_DIRS}
   ${GST_ALLOC_LIBRARY_DIRS}
   ${CAIRO_LIBRARY_DIRS}
+  ${NNSTREAMER_LIBRARY_DIRS}
 )
 
 # Shared common library
@@ -44,6 +47,7 @@ add_executable(yolov8n_reference
 target_link_libraries(yolov8n_reference
   ${GSTREAMER_LIBRARIES}
   ${CAIRO_LIBRARIES}
+  ${NNSTREAMER_LIBRARIES}
   "${OpenMP_CXX_FLAGS}"
 )
 target_compile_options(yolov8n_reference PRIVATE "${OpenMP_CXX_FLAGS}")
@@ -58,6 +62,7 @@ target_link_libraries(yolov8n_imx95
   ${GSTREAMER_LIBRARIES}
   ${GST_ALLOC_LIBRARIES}
   ${CAIRO_LIBRARIES}
+  ${NNSTREAMER_LIBRARIES}
   edgefirst_hal
 )
 
@@ -71,6 +76,7 @@ target_link_libraries(yolov8n_imx8mp
   ${GSTREAMER_LIBRARIES}
   ${GST_ALLOC_LIBRARIES}
   ${CAIRO_LIBRARIES}
+  ${NNSTREAMER_LIBRARIES}
   edgefirst_hal
 )
 
@@ -83,6 +89,7 @@ add_executable(yolov8n_ara2
 target_link_libraries(yolov8n_ara2
   ${GSTREAMER_LIBRARIES}
   ${GST_ALLOC_LIBRARIES}
+  ${NNSTREAMER_LIBRARIES}
   edgefirst_hal
 )
 
@@ -95,4 +102,5 @@ add_executable(yolov8n_ara2_reference
 )
 target_link_libraries(yolov8n_ara2_reference
   ${GSTREAMER_LIBRARIES}
+  ${NNSTREAMER_LIBRARIES}
 )
