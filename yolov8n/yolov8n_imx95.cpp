@@ -107,6 +107,11 @@ typedef struct {
 
   // CameraAdaptor element (for letterbox query)
   GstElement *cameraadaptor;
+
+  // Frame counting
+  int numFrames;
+  int frameCount;
+  bool timingPrinted;
 } AppData;
 
 
@@ -137,6 +142,8 @@ static GstPadProbeReturn preprocSrcProbe(GstPad *, GstPadProbeInfo *, gpointer u
 static void printTimingStatistics(void *userData)
 {
   AppData *app = (AppData *)userData;
+  if (app->timingPrinted) return;
+  app->timingPrinted = true;
 
   printf("\n");
   printf("==============================================================================\n");
@@ -351,6 +358,11 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   if (app->ptsTracker.consumeStart(buffer, ptsStart)) {
     app->timing.e2ePipeline.record(timeDiffMs(ptsStart, postEnd));
   }
+
+  // Frame counting for -n option
+  if (app->numFrames > 0 && ++app->frameCount >= app->numFrames) {
+    g_main_loop_quit(app->loop);
+  }
 }
 
 static void drawCallback(GstElement *, cairo_t *cr, guint64, guint64, gpointer user_data)
@@ -474,6 +486,7 @@ int main(int argc, char **argv)
   AppData app = {};
   app.headless = pargs.headless;
   app.instrumented = pargs.instrumented;
+  app.numFrames = pargs.numFrames;
   app.timing.preproc.reset();
   app.timing.inference.reset();
   app.timing.halDecode.reset();
@@ -532,6 +545,10 @@ int main(int argc, char **argv)
   // Run
   gst_element_set_state(app.gstPipeline, GST_STATE_PLAYING);
   g_main_loop_run(app.loop);
+
+  // Print timing statistics on exit
+  if (app.instrumented)
+    printTimingStatistics(&app);
 
   // Cleanup
   gst_element_set_state(app.gstPipeline, GST_STATE_NULL);
