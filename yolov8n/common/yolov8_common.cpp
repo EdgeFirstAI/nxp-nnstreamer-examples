@@ -343,7 +343,7 @@ char *buildSourceElement(InputSource source, const ParsedArgs &args,
     case INPUT_IMAGE:
       return g_strdup_printf(
           "filesrc location=%s ! jpegdec ! imxvideoconvert_g2d ! "
-          "video/x-raw,width=%d,height=%d ! imagefreeze",
+          "video/x-raw,format=NV12,width=%d,height=%d ! imagefreeze",
           args.image.c_str(), srcWidth, srcHeight);
 
     case INPUT_VIDEO:
