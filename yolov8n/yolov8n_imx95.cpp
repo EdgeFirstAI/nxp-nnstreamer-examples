@@ -265,12 +265,13 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
              qp.scale, qp.zeroPoint);
 
     gchar *json = g_strdup_printf(HAL_CONFIG_FMT, qp.scale, qp.zeroPoint);
-    hal_decoder_params params = hal_decoder_params_default();
-    params.config_json = json;
-    params.score_threshold = CONF_THRESHOLD;
-    params.iou_threshold = NMS_IOU_THRESHOLD;
-    params.nms = HAL_NMS_CLASS_AGNOSTIC;
-    app->decoder = hal_decoder_new(&params);
+    hal_decoder_params *params = hal_decoder_params_new();
+    hal_decoder_params_set_config_json(params, json, 0);
+    hal_decoder_params_set_score_threshold(params, CONF_THRESHOLD);
+    hal_decoder_params_set_iou_threshold(params, NMS_IOU_THRESHOLD);
+    hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
+    app->decoder = hal_decoder_new(params);
+    hal_decoder_params_free(params);
     g_free(json);
 
     if (!app->decoder) {
