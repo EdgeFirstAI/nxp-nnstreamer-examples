@@ -22,7 +22,7 @@
  *   3. Colorspace: videoconvert (RGBA → RGB strip alpha channel)
  *   4. Tensor Conversion: tensor_converter (RGB frame → tensor buffer)
  *   5. Transpose: tensor_transform (HWC → CHW layout for Ara-2)
- *   6. Tensor Shift: typecast uint8→int8 + add -128 (XOR 0x80 equivalent)
+ *   6. Tensor Shift: uint8→int16, add -128, int16→int8 (avoids int8 saturation)
  *   7. Memory merge: tensor_aggregator (consolidate buffer memory blocks)
  *
  * IMPORTANT: tensor_converter must output format=static (not flexible) to
@@ -262,7 +262,7 @@ static void printTiming(void *userData)
   printMetric("5. Transpose [tensor_transform]",
       "HWC -> CHW layout for Ara-2", app->transpose);
   printMetric("6. Tensor Shift [typecast + add]",
-      "uint8->int8 + add -128 (XOR 0x80 equivalent)", app->tensorShift);
+      "uint8->int16-128->int8 (two-step to avoid saturation)", app->tensorShift);
 
   if (app->preprocTotal.count > 0) {
     printf("\n  >> PREPROCESSING TOTAL\n");
@@ -688,8 +688,9 @@ static char *buildPipeline(Platform platform, const ParsedArgs &pargs,
         "tensor_converter name=tconv ! "
         "other/tensor,format=static,dimension=3:%d:%d:1,type=uint8 ! "
         "tensor_transform name=transpose mode=transpose option=1:2:0:3 ! "
-        "tensor_transform name=tshift mode=arithmetic "
-        "option=typecast:int8,add:-128 ! "
+        "tensor_transform name=tshift1 mode=arithmetic "
+        "option=typecast:int16,add:-128 ! "
+        "tensor_transform name=tshift2 mode=typecast option=int8 ! "
         "tensor_aggregator name=tagg frames-in=1 frames-out=1 frames-flush=1 ! "
         "tensor_filter name=tfilter framework=ara2 model=%s "
         "custom=EnableStats:true latency=1 ! "
@@ -711,8 +712,9 @@ static char *buildPipeline(Platform platform, const ParsedArgs &pargs,
         "tensor_converter name=tconv ! "
         "other/tensor,format=static,dimension=3:%d:%d:1,type=uint8 ! "
         "tensor_transform name=transpose mode=transpose option=1:2:0:3 ! "
-        "tensor_transform name=tshift mode=arithmetic "
-        "option=typecast:int8,add:-128 ! "
+        "tensor_transform name=tshift1 mode=arithmetic "
+        "option=typecast:int16,add:-128 ! "
+        "tensor_transform name=tshift2 mode=typecast option=int8 ! "
         "tensor_aggregator name=tagg frames-in=1 frames-out=1 frames-flush=1 ! "
         "tensor_filter name=tfilter framework=ara2 model=%s "
         "custom=EnableStats:true latency=1 ! "
