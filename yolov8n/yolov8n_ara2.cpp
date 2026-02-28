@@ -31,6 +31,7 @@
 #include <gst/allocators/gstdmabuf.h>
 #include <glib.h>
 #include <glib-unix.h>
+#include <cairo.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -42,13 +43,14 @@
 #include <unistd.h>
 #include <vector>
 
+#include "logging.hpp"
+
 #include "common/yolov8_common.hpp"
 
 #include <edgefirst/hal.h>
 
 
 #define NUM_OUTPUTS 2  /* scores + boxes tensors */
-#define DEFAULT_CAMERA_DEVICE "/dev/video3"
 
 // HAL JSON template — quantization filled from GstNnsTensorQuantMeta at runtime
 static const char *HAL_CONFIG_FMT =
@@ -58,6 +60,39 @@ static const char *HAL_CONFIG_FMT =
     "{\"decoder\":\"ultralytics\",\"type\":\"boxes\","
     "\"shape\":[1,4,8400],\"quantization\":[%g,%" G_GINT64_FORMAT "],\"dtype\":\"int16\",\"signed\":true}"
     "],\"nms\":\"class_agnostic\"}";
+
+
+/* ─── Platform configuration ──────────────────────────────────────── */
+
+enum Platform { PLATFORM_IMX95, PLATFORM_IMX8MP };
+
+struct PlatformConfig {
+  const char *name;
+  const char *defaultCamera;
+  bool usesLibcamerasrc;
+};
+
+static const PlatformConfig platformConfigs[] = {
+  [PLATFORM_IMX95] = {
+    .name = "i.MX 95",
+    .defaultCamera = NULL,
+    .usesLibcamerasrc = true,
+  },
+  [PLATFORM_IMX8MP] = {
+    .name = "i.MX 8M Plus",
+    .defaultCamera = "/dev/video3",
+    .usesLibcamerasrc = false,
+  },
+};
+
+
+/* ─── Detection result for display ────────────────────────────────── */
+
+struct DetectionResult {
+  int classId;
+  float score;
+  float x, y, w, h;
+};
 
 
 /* --- Application data ---------------------------------------------------- */
@@ -85,6 +120,11 @@ struct AppData {
   GstElement *tensorFilter;
   GstElement *cameraadaptor;
   LetterboxParams letterbox;
+
+  bool headless;
+
+  // Detection results for display overlay
+  std::vector<DetectionResult> results;
 
   // HAL decoder
   hal_decoder *decoder;
@@ -170,6 +210,29 @@ static void printTiming(void *userData)
 }
 
 
+/* --- Cairo draw callback ------------------------------------------------- */
+
+static void drawCallback(GstElement *, cairo_t *cr, guint64, guint64, gpointer user_data)
+{
+  AppData *app = (AppData *)user_data;
+  if (app->results.empty()) return;
+
+  cairo_set_source_rgb(cr, 0, 1, 0);
+  cairo_set_line_width(cr, 2.0);
+
+  for (auto &det : app->results) {
+    cairo_rectangle(cr, det.x, det.y, det.w, det.h);
+    cairo_move_to(cr, det.x + 5, det.y + 15);
+    const char *name = (det.classId >= 0 && det.classId < NUM_CLASSES)
+        ? cocoClassNames[det.classId] : "?";
+    char label[64];
+    snprintf(label, sizeof(label), "%s %.0f%%", name, det.score * 100);
+    cairo_show_text(cr, label);
+  }
+  cairo_stroke(cr);
+}
+
+
 /* --- tensor_sink new-data callback --------------------------------------- */
 
 static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
@@ -188,8 +251,8 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     app->letterbox.scale = scale;
     app->letterbox.padX = left;
     app->letterbox.padY = top;
-    g_print("Letterbox (from cameraadaptor): scale=%.4f top=%d left=%d\n",
-            scale, top, left);
+    log_info("Letterbox (from cameraadaptor): scale=%.4f top=%d left=%d\n",
+             scale, top, left);
   }
 
   // Frame-to-frame interval
@@ -199,10 +262,10 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   queryInferenceLatency(app->tensorFilter, app->inference);
 
   // Validate buffer — expect 2 memory blocks (scores + boxes)
-  if (!GST_IS_BUFFER(buffer)) { g_printerr("ERROR: invalid buffer\n"); return; }
+  if (!GST_IS_BUFFER(buffer)) { log_error("Invalid buffer\n"); return; }
   guint n_mem = gst_buffer_n_memory(buffer);
   if (n_mem != NUM_OUTPUTS) {
-    g_printerr("ERROR: expected %d tensors, got %u\n", NUM_OUTPUTS, n_mem);
+    log_error("Expected %d tensors, got %u\n", NUM_OUTPUTS, n_mem);
     return;
   }
 
@@ -211,7 +274,7 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     QuantParams scores_qp, boxes_qp;
     if (!extractQuantParams(buffer, 0, scores_qp) ||
         !extractQuantParams(buffer, 1, boxes_qp)) {
-      g_printerr("ERROR: No quant meta — requires updated NNStreamer\n");
+      log_error("No quant meta — requires updated NNStreamer\n");
       return;
     }
 
@@ -228,12 +291,12 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     g_free(json);
 
     if (!app->decoder) {
-      g_printerr("ERROR: HAL decoder creation failed\n");
+      log_error("HAL decoder creation failed\n");
       return;
     }
 
     char *model_type = hal_decoder_model_type(app->decoder);
-    g_print("HAL decoder: type=%s\n", model_type ? model_type : "unknown");
+    log_info("HAL decoder: type=%s\n", model_type ? model_type : "unknown");
     free(model_type);
   }
 
@@ -255,13 +318,13 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     app->out_ndims[1] = 3;
 
     app->meta_populated = TRUE;
-    g_print("Output tensor metadata:\n");
-    g_print("  [0] scores: U8  shape=[%zu, %zu, %zu]\n",
-            app->out_shapes[0][0], app->out_shapes[0][1],
-            app->out_shapes[0][2]);
-    g_print("  [1] boxes:  I16 shape=[%zu, %zu, %zu]\n\n",
-            app->out_shapes[1][0], app->out_shapes[1][1],
-            app->out_shapes[1][2]);
+    log_info("Output tensor metadata:\n");
+    log_info("  [0] scores: U8  shape=[%zu, %zu, %zu]\n",
+             app->out_shapes[0][0], app->out_shapes[0][1],
+             app->out_shapes[0][2]);
+    log_info("  [1] boxes:  I16 shape=[%zu, %zu, %zu]\n\n",
+             app->out_shapes[1][0], app->out_shapes[1][1],
+             app->out_shapes[1][2]);
   }
 
   // Wrap output tensors as HAL tensors
@@ -281,7 +344,7 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
           app->out_shapes[j], app->out_ndims[j], NULL);
     } else {
       if (!gst_memory_map(mem, &out_maps[j], GST_MAP_READ)) {
-        g_printerr("ERROR: cannot map output tensor %d\n", j);
+        log_error("Cannot map output tensor %d\n", j);
         goto cleanup;
       }
       out_mapped[j] = TRUE;
@@ -302,7 +365,7 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     }
 
     if (!hal_outputs[j]) {
-      g_printerr("ERROR: failed to create HAL tensor for output %d\n", j);
+      log_error("Failed to create HAL tensor for output %d\n", j);
       goto cleanup;
     }
   }
@@ -316,7 +379,7 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   if (decode_ret != 0) {
     static bool first_error = true;
     if (first_error) {
-      g_printerr("WARNING: HAL decoder_decode failed (ret=%d)\n", decode_ret);
+      log_error("HAL decoder_decode failed (ret=%d)\n", decode_ret);
       first_error = false;
     }
     goto cleanup;
@@ -326,6 +389,21 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   {
     size_t num_dets = hal_detect_box_list_len(boxes);
     app->totalFrames++;
+
+    // Store detections for display overlay
+    app->results.clear();
+    for (size_t d = 0; d < num_dets; d++) {
+      hal_detect_box box;
+      if (hal_detect_box_list_get(boxes, d, &box) == 0) {
+        /* HAL decoder with normalized:false returns model pixel coords
+         * directly — do NOT multiply by MODEL_INPUT_SIZE. */
+        float px = (box.xmin - app->letterbox.padX) / app->letterbox.scale;
+        float py = (box.ymin - app->letterbox.padY) / app->letterbox.scale;
+        float bw = (box.xmax - box.xmin) / app->letterbox.scale;
+        float bh = (box.ymax - box.ymin) / app->letterbox.scale;
+        app->results.push_back({(int)box.label, box.score, px, py, bw, bh});
+      }
+    }
 
     // Frame limit — stop after N frames and print timing
     if (app->maxFrames > 0 && app->totalFrames >= app->maxFrames) {
@@ -355,24 +433,14 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
       // Print first frame detections
       static bool first_print = true;
       if (first_print) {
-        g_print("Detected objects (%zu):\n", num_dets);
-        for (size_t d = 0; d < num_dets; d++) {
-          hal_detect_box box;
-          if (hal_detect_box_list_get(boxes, d, &box) == 0) {
-            /* HAL decoder with normalized:false returns model pixel coords
-             * directly — do NOT multiply by MODEL_INPUT_SIZE. */
-            float px = (box.xmin - app->letterbox.padX) / app->letterbox.scale;
-            float py = (box.ymin - app->letterbox.padY) / app->letterbox.scale;
-            float bw = (box.xmax - box.xmin) / app->letterbox.scale;
-            float bh = (box.ymax - box.ymin) / app->letterbox.scale;
-
-            const char *name = (box.label >= 0 && box.label < NUM_CLASSES)
-                ? cocoClassNames[box.label] : "unknown";
-            g_print("  - %s (%.2f) at (%.0f,%.0f) %.0fx%.0f\n",
-                    name, box.score, px, py, bw, bh);
-          }
+        log_info("Detected objects (%zu):\n", num_dets);
+        for (auto &det : app->results) {
+          const char *name = (det.classId >= 0 && det.classId < NUM_CLASSES)
+              ? cocoClassNames[det.classId] : "unknown";
+          log_info("  - %s (%.2f) at (%.0f,%.0f) %.0fx%.0f\n",
+                   name, det.score, det.x, det.y, det.w, det.h);
         }
-        g_print("\n");
+        log_info("\n");
         first_print = false;
       }
     }
@@ -400,72 +468,130 @@ cleanup:
 int main(int argc, char **argv)
 {
   ParsedArgs pargs;
-  pargs.camera = DEFAULT_CAMERA_DEVICE;
+  pargs.camera = "";  // Will be set from platform default
 
-  uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO | ARG_IMAGE | ARG_NUM_FRAMES;
+  uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO | ARG_IMAGE |
+                   ARG_HEADLESS | ARG_NUM_FRAMES | ARG_PLATFORM;
 
   int ret = parseArgs(argc, argv, flags,
       "YOLOv8n 640x640 for Kinara Ara-2 NPU — EdgeFirst CameraAdaptor + HAL", pargs);
   if (ret != 0) return ret > 0 ? 0 : 1;
 
   if (pargs.model.empty()) {
-    g_printerr("ERROR: provide model path with -m\n");
+    log_error("Provide model path with -m\n");
     return 1;
   }
 
+  // Parse platform
+  Platform platform = PLATFORM_IMX8MP;
+  bool platformSet = false;
+  if (!pargs.platformStr.empty()) {
+    if (pargs.platformStr == "imx95") {
+      platform = PLATFORM_IMX95;
+      platformSet = true;
+    } else if (pargs.platformStr == "imx8mp") {
+      platform = PLATFORM_IMX8MP;
+      platformSet = true;
+    } else {
+      log_error("Unknown platform: %s (use imx95 or imx8mp)\n", pargs.platformStr.c_str());
+      return 1;
+    }
+  }
+
+  if (!platformSet) {
+    log_error("Provide platform with --platform imx95 or --platform imx8mp\n");
+    return 1;
+  }
+
+  const PlatformConfig &plat = platformConfigs[platform];
+
+  // Set default camera if not specified
+  if (pargs.camera.empty() && plat.defaultCamera)
+    pargs.camera = plat.defaultCamera;
+
+  // Platform-specific environment setup
+  if (platform == PLATFORM_IMX95)
+    setupImx95Environment();
+
   gst_init(&argc, &argv);
 
-  // Build source element
-  InputSource srcType = determineInputSource(pargs, false);
-  char *srcStr = buildSourceElement(srcType, pargs);
-  g_print("Input: %s\n",
-          srcType == INPUT_IMAGE ? pargs.image.c_str() :
-          srcType == INPUT_VIDEO ? pargs.video.c_str() : pargs.camera.c_str());
+  log_info("YOLOv8n 640x640 for Kinara Ara-2 NPU — %s\n", plat.name);
+  log_info("Model: %s\n", pargs.model.c_str());
+  if (!pargs.image.empty()) {
+    log_info("Input: image (%s)\n", pargs.image.c_str());
+  } else if (!pargs.video.empty()) {
+    log_info("Input: video (%s)\n", pargs.video.c_str());
+  } else {
+    log_info("Input: camera (%s)\n", pargs.camera.empty() ? "libcamerasrc" : pargs.camera.c_str());
+  }
+  if (pargs.numFrames > 0)
+    log_info("Frames: %d\n", pargs.numFrames);
+  if (pargs.headless)
+    log_info("Mode: headless (no display)\n");
 
-  // Pipeline: source → cameraadaptor → ara2 → tensor_sink
-  gchar *pipelineStr = g_strdup_printf(
-      "%s ! "
+  // Build source element
+  InputSource srcType = determineInputSource(pargs, plat.usesLibcamerasrc);
+  char *srcStr = buildSourceElement(srcType, pargs);
+
+  // Build NN processing branch
+  char *nnBranch = g_strdup_printf(
       "queue name=thread-nn leaky=2 max-size-buffers=2 ! "
       "edgefirstcameraadaptor name=preproc model-width=%d model-height=%d "
       "model-dtype=int8 model-layout=chw letterbox=true ! "
       "tensor_filter name=tfilter framework=ara2 model=%s "
       "custom=EnableStats:true latency=1 ! "
       "tensor_sink name=inferenceOutput",
-      srcStr,
       MODEL_INPUT_SIZE, MODEL_INPUT_SIZE,
       pargs.model.c_str());
+
+  // Build full pipeline
+  char *pipelineStr;
+  if (pargs.headless) {
+    pipelineStr = g_strdup_printf("%s ! %s", srcStr, nnBranch);
+  } else {
+    const char *syncMode = (srcType == INPUT_IMAGE || srcType == INPUT_VIDEO) ? "true" : "false";
+    pipelineStr = g_strdup_printf(
+        "%s ! tee name=t "
+        "t. ! %s "
+        "t. ! queue name=thread-img max-size-buffers=2 ! "
+        "imxvideoconvert_g2d ! "
+        "cairooverlay name=cairo ! "
+        "waylandsink sync=%s",
+        srcStr, nnBranch, syncMode);
+  }
   g_free(srcStr);
+  g_free(nnBranch);
 
-  g_print("Pipeline:\n%s\n\n", pipelineStr);
-
-  if (pargs.numFrames > 0)
-    g_print("Frames: %d\n", pargs.numFrames);
+  log_info("Pipeline: %s\n\n", pipelineStr);
 
   AppData app = {};
   app.maxFrames = pargs.numFrames;
+  app.headless = pargs.headless;
   app.preproc.reset();
   app.inference.reset();
   app.postproc.reset();
   app.throughput.reset();
+
+  bool startedOnce = false;
+  app.busCtx.playing = &app.playing;
+  app.busCtx.startedOnce = pargs.headless ? NULL : &startedOnce;
+  app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
+  app.busCtx.videoRate = 1.0;
+  app.busCtx.printTiming = printTiming;
+  app.busCtx.appData = &app;
 
   app.loop = g_main_loop_new(NULL, FALSE);
   app.pipeline = gst_parse_launch(pipelineStr, NULL);
   g_free(pipelineStr);
 
   if (!app.pipeline) {
-    g_printerr("ERROR: failed to create pipeline\n");
+    log_error("Failed to create pipeline\n");
     return 1;
   }
 
   // Configure common bus callback
   app.busCtx.pipeline = app.pipeline;
   app.busCtx.loop = app.loop;
-  app.busCtx.playing = &app.playing;
-  app.busCtx.startedOnce = NULL;  // No state-change suppression
-  app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
-  app.busCtx.videoRate = 1.0;
-  app.busCtx.printTiming = printTiming;
-  app.busCtx.appData = &app;
 
   // Bus
   app.bus = gst_element_get_bus(app.pipeline);
@@ -476,6 +602,15 @@ int main(int argc, char **argv)
   GstElement *tsink = gst_bin_get_by_name(GST_BIN(app.pipeline), "inferenceOutput");
   g_signal_connect(tsink, "new-data", G_CALLBACK(newDataCallback), &app);
   gst_object_unref(tsink);
+
+  // Cairo overlay (only when displaying)
+  if (!pargs.headless) {
+    GstElement *cairo = gst_bin_get_by_name(GST_BIN(app.pipeline), "cairo");
+    if (cairo) {
+      g_signal_connect(cairo, "draw", G_CALLBACK(drawCallback), &app);
+      gst_object_unref(cairo);
+    }
+  }
 
   // tensor_filter for latency query
   app.tensorFilter = gst_bin_get_by_name(GST_BIN(app.pipeline), "tfilter");

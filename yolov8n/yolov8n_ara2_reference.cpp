@@ -9,6 +9,9 @@
  * No EdgeFirst dependencies — purpose is A/B comparison against the
  * EdgeFirst-optimized yolov8n_ara2 variant.
  *
+ * Supports both i.MX 8M Plus (v4l2src) and i.MX 95 (libcamerasrc) via
+ * the --platform flag.
+ *
  * Ara-2 YOLOv8n.dvm output tensors (split format):
  *   [0] scores — uint8  [80, 8400]  (post-sigmoid class confidences)
  *   [1] boxes  — int16  [4, 8400]   (cx, cy, w, h in model pixel space)
@@ -29,12 +32,15 @@
  * POST-PROCESSING: Manual dequantization from split tensors + NMS
  *
  * Usage:
- *   ./yolov8n_ara2_reference -m yolov8n.dvm -v test.mp4
+ *   ./yolov8n_ara2_reference -m yolov8n.dvm -p imx95
+ *   ./yolov8n_ara2_reference -m yolov8n.dvm -p imx8mp -v test.mp4
+ *   ./yolov8n_ara2_reference -m yolov8n.dvm -p imx95 -H -n 100
  */
 
 #include <gst/gst.h>
 #include <glib.h>
 #include <glib-unix.h>
+#include <cairo.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -47,10 +53,45 @@
 #include <sys/time.h>
 #include <vector>
 
+#include "logging.hpp"
+
 #include "common/yolov8_common.hpp"
 
 
 #define NUM_OUTPUTS 2  /* scores + boxes tensors */
+
+
+/* ─── Platform configuration ──────────────────────────────────────── */
+
+enum Platform { PLATFORM_IMX95, PLATFORM_IMX8MP };
+
+struct PlatformConfig {
+  const char *name;
+  const char *defaultCamera;
+  bool usesLibcamerasrc;
+};
+
+static const PlatformConfig platformConfigs[] = {
+  [PLATFORM_IMX95] = {
+    .name = "i.MX 95",
+    .defaultCamera = NULL,
+    .usesLibcamerasrc = true,
+  },
+  [PLATFORM_IMX8MP] = {
+    .name = "i.MX 8M Plus",
+    .defaultCamera = "/dev/video3",
+    .usesLibcamerasrc = false,
+  },
+};
+
+
+/* ─── Detection result for display ────────────────────────────────── */
+
+struct DetectionResult {
+  int classId;
+  float score;
+  float x, y, w, h;
+};
 
 
 /* ─── Application data ────────────────────────────────────────────── */
@@ -60,6 +101,8 @@ struct AppData {
   GMainLoop *loop;
   GstBus *bus;
   gboolean playing;
+
+  bool headless;
 
   /* Timing — preprocessing stages */
   TimingMetric g2dScale;
@@ -102,6 +145,9 @@ struct AppData {
 
   GstElement *tensorFilter;
   LetterboxParams letterboxParams;
+
+  /* Detection results for display overlay */
+  std::vector<DetectionResult> results;
 
   /* Quantization parameters (from GstNnsTensorQuantMeta) */
   double scoresScale;
@@ -356,6 +402,29 @@ static void printTiming(void *userData)
 }
 
 
+/* ─── Cairo draw callback ─────────────────────────────────────────── */
+
+static void drawCallback(GstElement *, cairo_t *cr, guint64, guint64, gpointer user_data)
+{
+  AppData *app = (AppData *)user_data;
+  if (app->results.empty()) return;
+
+  cairo_set_source_rgb(cr, 0, 1, 0);
+  cairo_set_line_width(cr, 2.0);
+
+  for (auto &det : app->results) {
+    cairo_rectangle(cr, det.x, det.y, det.w, det.h);
+    cairo_move_to(cr, det.x + 5, det.y + 15);
+    const char *name = (det.classId >= 0 && det.classId < NUM_CLASSES)
+        ? cocoClassNames[det.classId] : "?";
+    char label[64];
+    snprintf(label, sizeof(label), "%s %.0f%%", name, det.score * 100);
+    cairo_show_text(cr, label);
+  }
+  cairo_stroke(cr);
+}
+
+
 /* ─── tensor_sink new-data callback ───────────────────────────────── */
 
 static void
@@ -374,12 +443,12 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
 
   /* Validate buffer — expect 2 memory blocks (scores + boxes) */
   if (!GST_IS_BUFFER(buffer)) {
-    g_printerr("ERROR: invalid buffer\n");
+    log_error("Invalid buffer\n");
     return;
   }
   guint n_mem = gst_buffer_n_memory(buffer);
   if (n_mem != NUM_OUTPUTS) {
-    g_printerr("ERROR: expected %d tensors, got %u\n", NUM_OUTPUTS, n_mem);
+    log_error("Expected %d tensors, got %u\n", NUM_OUTPUTS, n_mem);
     return;
   }
 
@@ -389,11 +458,11 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   GstMemory *box_mem = gst_buffer_peek_memory(buffer, 1);
 
   if (!gst_memory_map(score_mem, &score_map, GST_MAP_READ)) {
-    g_printerr("ERROR: cannot map score tensor\n");
+    log_error("Cannot map score tensor\n");
     return;
   }
   if (!gst_memory_map(box_mem, &box_map, GST_MAP_READ)) {
-    g_printerr("ERROR: cannot map box tensor\n");
+    log_error("Cannot map box tensor\n");
     gst_memory_unmap(score_mem, &score_map);
     return;
   }
@@ -406,7 +475,7 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     QuantParams scores_qp, boxes_qp;
     if (!extractQuantParams(buffer, 0, scores_qp) ||
         !extractQuantParams(buffer, 1, boxes_qp)) {
-      g_printerr("ERROR: No quant meta — requires updated NNStreamer\n");
+      log_error("No quant meta — requires updated NNStreamer\n");
       gst_memory_unmap(score_mem, &score_map);
       gst_memory_unmap(box_mem, &box_map);
       return;
@@ -478,13 +547,13 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
         return a.conf > b.conf;
       });
 
-  std::vector<Detection> results;
+  std::vector<Detection> nmsResults;
   std::vector<bool> suppressed(candidates.size(), false);
 
   for (size_t i = 0; i < candidates.size(); i++) {
     if (suppressed[i])
       continue;
-    results.push_back(candidates[i]);
+    nmsResults.push_back(candidates[i]);
 
     for (size_t j = i + 1; j < candidates.size(); j++) {
       if (suppressed[j])
@@ -511,11 +580,17 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
 
   app->totalFrames++;
 
+  // Store detections for display overlay
+  app->results.clear();
+  for (auto &det : nmsResults) {
+    app->results.push_back({det.classId, det.conf, det.x, det.y, det.w, det.h});
+  }
+
   // Frame limit — stop after N frames and print timing
   if (app->maxFrames > 0 && app->totalFrames >= app->maxFrames) {
-    if (!results.empty()) {
+    if (!nmsResults.empty()) {
       app->framesWithDetections++;
-      app->totalDetections += results.size();
+      app->totalDetections += nmsResults.size();
     }
     app->postprocTotal.record(timeDiffMs(callbackStart, nmsEnd));
     printTiming(app);
@@ -523,24 +598,24 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     return;
   }
 
-  if (!results.empty()) {
+  if (!nmsResults.empty()) {
     app->framesWithDetections++;
-    app->totalDetections += results.size();
+    app->totalDetections += nmsResults.size();
 
     /* Print first frame detections */
     static bool first_print = true;
     if (first_print) {
-      g_print("Detected objects (%zu):\n", results.size());
-      for (size_t d = 0; d < results.size(); d++) {
-        const char *name = (results[d].classId < NUM_CLASSES)
-            ? cocoClassNames[results[d].classId]
+      log_info("Detected objects (%zu):\n", nmsResults.size());
+      for (size_t d = 0; d < nmsResults.size(); d++) {
+        const char *name = (nmsResults[d].classId < NUM_CLASSES)
+            ? cocoClassNames[nmsResults[d].classId]
             : "unknown";
-        g_print("  - %s (%.2f) at (%.0f,%.0f) %.0fx%.0f\n",
-            name, results[d].conf,
-            results[d].x, results[d].y,
-            results[d].w, results[d].h);
+        log_info("  - %s (%.2f) at (%.0f,%.0f) %.0fx%.0f\n",
+            name, nmsResults[d].conf,
+            nmsResults[d].x, nmsResults[d].y,
+            nmsResults[d].w, nmsResults[d].h);
       }
-      g_print("\n");
+      log_info("\n");
       first_print = false;
     }
   }
@@ -591,40 +666,35 @@ static void installProbes(GstElement *pipeline, AppData *app)
 }
 
 
-/* ─── Main ────────────────────────────────────────────────────────── */
+/* ─── Pipeline construction ───────────────────────────────────────── */
 
-int main(int argc, char **argv)
+static char *buildPipeline(Platform platform, const ParsedArgs &pargs,
+                           const LetterboxParams &lb, bool headless)
 {
-  ParsedArgs pargs;
-  uint32_t flags = ARG_MODEL | ARG_VIDEO | ARG_NUM_FRAMES;
+  const PlatformConfig &plat = platformConfigs[platform];
 
-  int ret = parseArgs(argc, argv, flags,
-      "YOLOv8n 640x640 Reference Pipeline for Kinara Ara-2 NPU", pargs);
-  if (ret != 0) return ret > 0 ? 0 : 1;
+  // Source element
+  InputSource srcType = determineInputSource(pargs, plat.usesLibcamerasrc);
+  char *srcStr = buildSourceElement(srcType, pargs);
 
-  if (pargs.model.empty()) {
-    g_printerr("ERROR: provide model path with -m\n");
-    return 1;
+  // For display mode, wrap source with tee (except headless)
+  std::string source;
+  if (headless) {
+    char *s = g_strdup_printf("%s ! queue name=thread-nn leaky=2 max-size-buffers=2", srcStr);
+    source = s;
+    g_free(s);
+  } else {
+    char *s = g_strdup_printf("%s ! tee name=t "
+        "t. ! queue name=thread-nn leaky=2 max-size-buffers=2", srcStr);
+    source = s;
+    g_free(s);
   }
-  if (pargs.video.empty()) {
-    g_printerr("ERROR: provide video path with -v\n");
-    return 1;
-  }
+  g_free(srcStr);
 
-  gst_init(&argc, &argv);
-
-  /* Letterbox */
-  LetterboxParams lb = calculateLetterbox(SOURCE_WIDTH, SOURCE_HEIGHT);
-  g_print("Letterbox: %dx%d -> scale %.4f -> %dx%d + pad L=%d R=%d T=%d B=%d\n",
-      SOURCE_WIDTH, SOURCE_HEIGHT, lb.scale, lb.scaledW, lb.scaledH,
-      lb.padX, lb.padRight, lb.padY, lb.padBottom);
-
-  /* Pipeline: standard NXP preprocessing + Ara-2 NPU inference. */
-  gchar *pipelineStr = g_strdup_printf(
-      "filesrc location=%s ! qtdemux ! h264parse ! v4l2h264dec ! "
-      "queue name=thread-nn leaky=2 max-size-buffers=2 ! "
-      "imxvideoconvert_g2d name=g2d_scale ! "
-      "video/x-raw,width=%d,height=%d,format=RGBA ! "
+  // NN branch: preprocessing + inference + sink
+  char *nnBranch = g_strdup_printf(
+      "%s ! "
+      "imxvideoconvert_g2d name=g2d_scale ! video/x-raw,width=%d,height=%d,format=RGBA ! "
       "videobox name=letterbox left=%d right=%d top=%d bottom=%d fill=black ! "
       "videoconvert name=colorconv ! video/x-raw,format=RGB ! "
       "tensor_converter name=tconv ! "
@@ -635,17 +705,108 @@ int main(int argc, char **argv)
       "tensor_filter name=tfilter framework=ara2 model=%s "
       "custom=EnableStats:true latency=1 ! "
       "tensor_sink name=inferenceOutput",
-      pargs.video.c_str(),
+      source.c_str(),
       lb.scaledW, lb.scaledH,
       -lb.padX, -lb.padRight, -lb.padY, -lb.padBottom,
       pargs.model.c_str());
 
-  g_print("Pipeline:\n%s\n\n", pipelineStr);
+  char *pipeline;
+  if (headless) {
+    pipeline = nnBranch;
+  } else {
+    const char *syncMode = (!pargs.video.empty() || !pargs.image.empty()) ? "true" : "false";
+    pipeline = g_strdup_printf(
+        "%s "
+        "t. ! queue name=thread-img max-size-buffers=2 ! "
+        "imxvideoconvert_g2d ! "
+        "cairooverlay name=cairo ! "
+        "waylandsink sync=%s",
+        nnBranch, syncMode);
+    g_free(nnBranch);
+  }
 
+  return pipeline;
+}
+
+
+/* ─── Main ────────────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+  ParsedArgs pargs;
+  pargs.camera = "";  // Will be set from platform default
+
+  uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO | ARG_IMAGE |
+                   ARG_HEADLESS | ARG_NUM_FRAMES | ARG_PLATFORM;
+
+  int ret = parseArgs(argc, argv, flags,
+      "YOLOv8n 640x640 Reference Pipeline for Kinara Ara-2 NPU", pargs);
+  if (ret != 0) return ret > 0 ? 0 : 1;
+
+  if (pargs.model.empty()) {
+    log_error("Provide model path with -m\n");
+    return 1;
+  }
+
+  // Parse platform
+  Platform platform = PLATFORM_IMX8MP;
+  bool platformSet = false;
+  if (!pargs.platformStr.empty()) {
+    if (pargs.platformStr == "imx95") {
+      platform = PLATFORM_IMX95;
+      platformSet = true;
+    } else if (pargs.platformStr == "imx8mp") {
+      platform = PLATFORM_IMX8MP;
+      platformSet = true;
+    } else {
+      log_error("Unknown platform: %s (use imx95 or imx8mp)\n", pargs.platformStr.c_str());
+      return 1;
+    }
+  }
+
+  if (!platformSet) {
+    log_error("Provide platform with --platform imx95 or --platform imx8mp\n");
+    return 1;
+  }
+
+  const PlatformConfig &plat = platformConfigs[platform];
+
+  // Set default camera if not specified
+  if (pargs.camera.empty() && plat.defaultCamera)
+    pargs.camera = plat.defaultCamera;
+
+  // Platform-specific environment setup
+  if (platform == PLATFORM_IMX95)
+    setupImx95Environment();
+
+  gst_init(&argc, &argv);
+
+  log_info("YOLOv8n 640x640 Reference Pipeline — Ara-2 NPU on %s\n", plat.name);
+  log_info("Model: %s\n", pargs.model.c_str());
+  if (!pargs.image.empty()) {
+    log_info("Input: image (%s)\n", pargs.image.c_str());
+  } else if (!pargs.video.empty()) {
+    log_info("Input: video (%s)\n", pargs.video.c_str());
+  } else {
+    log_info("Input: camera (%s)\n", pargs.camera.empty() ? "libcamerasrc" : pargs.camera.c_str());
+  }
   if (pargs.numFrames > 0)
-    g_print("Frames: %d\n", pargs.numFrames);
+    log_info("Frames: %d\n", pargs.numFrames);
+  if (pargs.headless)
+    log_info("Mode: headless (no display)\n");
+
+  /* Letterbox */
+  LetterboxParams lb = calculateLetterbox(SOURCE_WIDTH, SOURCE_HEIGHT);
+  log_info("Letterbox: %dx%d -> scale %.4f -> %dx%d + pad L=%d R=%d T=%d B=%d\n",
+      SOURCE_WIDTH, SOURCE_HEIGHT, lb.scale, lb.scaledW, lb.scaledH,
+      lb.padX, lb.padRight, lb.padY, lb.padBottom);
+
+  /* Build pipeline */
+  char *pipelineStr = buildPipeline(platform, pargs, lb, pargs.headless);
+  log_info("Pipeline: %s\n\n", pipelineStr);
 
   AppData app = {};
+  app.headless = pargs.headless;
   app.letterboxParams = lb;
   app.maxFrames = pargs.numFrames;
   app.g2dScale.reset();
@@ -665,24 +826,26 @@ int main(int argc, char **argv)
   app.throughput.reset();
   app.ptsTracker.init();
 
+  // Setup bus callback context
+  bool startedOnce = false;
+  app.busCtx.playing = &app.playing;
+  app.busCtx.startedOnce = pargs.headless ? NULL : &startedOnce;
+  app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
+  app.busCtx.videoRate = 1.0;
+  app.busCtx.printTiming = printTiming;
+  app.busCtx.appData = &app;
+
   app.loop = g_main_loop_new(NULL, FALSE);
   app.pipeline = gst_parse_launch(pipelineStr, NULL);
   g_free(pipelineStr);
 
   if (!app.pipeline) {
-    g_printerr("ERROR: failed to create pipeline\n");
+    log_error("Failed to create pipeline\n");
     return 1;
   }
 
-  // Setup bus callback context
   app.busCtx.pipeline = app.pipeline;
   app.busCtx.loop = app.loop;
-  app.busCtx.playing = &app.playing;
-  app.busCtx.startedOnce = NULL;  // No state-change suppression for this binary
-  app.busCtx.videoLoop = true;    // Always loop video
-  app.busCtx.videoRate = 1.0;
-  app.busCtx.printTiming = printTiming;
-  app.busCtx.appData = &app;
 
   /* Bus */
   app.bus = gst_element_get_bus(app.pipeline);
@@ -694,6 +857,15 @@ int main(int argc, char **argv)
       "inferenceOutput");
   g_signal_connect(tsink, "new-data", G_CALLBACK(newDataCallback), &app);
   gst_object_unref(tsink);
+
+  /* Cairo overlay (only when displaying) */
+  if (!pargs.headless) {
+    GstElement *cairo = gst_bin_get_by_name(GST_BIN(app.pipeline), "cairo");
+    if (cairo) {
+      g_signal_connect(cairo, "draw", G_CALLBACK(drawCallback), &app);
+      gst_object_unref(cairo);
+    }
+  }
 
   /* tensor_filter for latency */
   app.tensorFilter = gst_bin_get_by_name(GST_BIN(app.pipeline), "tfilter");
