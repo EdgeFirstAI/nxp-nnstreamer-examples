@@ -5,7 +5,7 @@
  * YOLOv8n 640x640 Reference Demo — Kinara Ara-2 NPU (Standard Pipeline)
  *
  * Reference baseline for Ara-2 NPU benchmarking. Uses the standard NXP
- * 6-element preprocessing pipeline with manual dequantization and NMS.
+ * 7-element preprocessing pipeline with manual dequantization and NMS.
  * No EdgeFirst dependencies — purpose is A/B comparison against the
  * EdgeFirst-optimized yolov8n_ara2 variant.
  *
@@ -16,14 +16,19 @@
  *   [0] scores — uint8  [80, 8400]  (post-sigmoid class confidences)
  *   [1] boxes  — int16  [4, 8400]   (cx, cy, w, h in model pixel space)
  *
- * PREPROCESSING PIPELINE (CPU-heavy, matches NXP reference pattern):
- *   1. G2D Scale+Colorspace: imxvideoconvert_g2d (1920x1080 → scaled RGBA)
- *   2. Letterbox Padding: videobox (padded to 640x640 with black borders)
+ * PREPROCESSING PIPELINE (CPU-heavy, NXP-style elements):
+ *   1. G2D Scale+Colorspace: imxvideoconvert_g2d (1920x1080 → 640x360 RGBA)
+ *   2. Letterbox Padding: videobox (640x360 → 640x640 with black borders)
  *   3. Colorspace: videoconvert (RGBA → RGB strip alpha channel)
  *   4. Tensor Conversion: tensor_converter (RGB frame → tensor buffer)
  *   5. Transpose: tensor_transform (HWC → CHW layout for Ara-2)
- *   6a. Tensor Transform #1: typecast uint8→int16 + add -128
- *   6b. Tensor Transform #2: typecast int16→int8
+ *   6. Tensor Shift: typecast uint8→int8 + add -128 (XOR 0x80 equivalent)
+ *   7. Memory merge: tensor_aggregator (consolidate buffer memory blocks)
+ *
+ * IMPORTANT: tensor_converter must output format=static (not flexible) to
+ * prevent tensor_transform from corrupting the 128-byte flexible header.
+ * tensor_aggregator merges the split memory blocks that tensor_transform
+ * produces into a single contiguous buffer for the Ara-2 tensor_filter.
  *
  * INFERENCE: tensor_filter framework=ara2
  *   The sub-plugin expects preprocessed int8 CHW tensors matching the
@@ -104,14 +109,16 @@ struct AppData {
 
   bool headless;
 
+  /* Letterbox parameters */
+  LetterboxParams letterbox;
+
   /* Timing — preprocessing stages */
   TimingMetric g2dScale;
-  TimingMetric letterbox;
+  TimingMetric letterboxTime;
   TimingMetric colorconv;
   TimingMetric tensorConv;
   TimingMetric transpose;
-  TimingMetric tensorShift1;
-  TimingMetric tensorShift2;
+  TimingMetric tensorShift;
   TimingMetric preprocTotal;
 
   /* Timing — inference */
@@ -133,8 +140,7 @@ struct AppData {
   struct timeval colorconvEnd;
   struct timeval tensorconvEnd;
   struct timeval transposeEnd;
-  struct timeval tshift1End;
-  struct timeval tshift2End;
+  struct timeval tshiftEnd;
 
   /* Detection statistics */
   int totalDetections;
@@ -144,7 +150,6 @@ struct AppData {
   int maxFrames;
 
   GstElement *tensorFilter;
-  LetterboxParams letterboxParams;
 
   /* Detection results for display overlay */
   std::vector<DetectionResult> results;
@@ -188,7 +193,7 @@ letterboxSrcProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
 {
   AppData *app = (AppData *)user_data;
   gettimeofday(&app->letterboxEnd, NULL);
-  app->letterbox.record(timeDiffMs(app->g2dEnd, app->letterboxEnd));
+  app->letterboxTime.record(timeDiffMs(app->g2dEnd, app->letterboxEnd));
   return GST_PAD_PROBE_OK;
 }
 
@@ -220,21 +225,12 @@ transposeSrcProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
 }
 
 static GstPadProbeReturn
-tshift1SrcProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
+tshiftSrcProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
 {
   AppData *app = (AppData *)user_data;
-  gettimeofday(&app->tshift1End, NULL);
-  app->tensorShift1.record(timeDiffMs(app->transposeEnd, app->tshift1End));
-  return GST_PAD_PROBE_OK;
-}
-
-static GstPadProbeReturn
-tshift2SrcProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  gettimeofday(&app->tshift2End, NULL);
-  app->tensorShift2.record(timeDiffMs(app->tshift1End, app->tshift2End));
-  app->preprocTotal.record(timeDiffMs(app->g2dStart, app->tshift2End));
+  gettimeofday(&app->tshiftEnd, NULL);
+  app->tensorShift.record(timeDiffMs(app->transposeEnd, app->tshiftEnd));
+  app->preprocTotal.record(timeDiffMs(app->g2dStart, app->tshiftEnd));
   return GST_PAD_PROBE_OK;
 }
 
@@ -256,19 +252,17 @@ static void printTiming(void *userData)
   printf("  ------------------------------------------------------------------"
          "----------\n");
   printMetric("1. G2D Scale + Colorspace [FUSED - HW accelerated]",
-      "1920x1080 NV12 -> scaled RGBA", app->g2dScale);
+      "1920x1080 NV12 -> 640x360 RGBA (aspect-fit)", app->g2dScale);
   printMetric("2. Letterbox Padding [videobox]",
-      "scaled -> 640x640 with black borders", app->letterbox);
+      "640x360 -> 640x640 with black borders", app->letterboxTime);
   printMetric("3. Colorspace Conversion [videoconvert]",
       "RGBA -> RGB strip alpha channel", app->colorconv);
   printMetric("4. Tensor Conversion [tensor_converter]",
       "RGB frame -> tensor buffer", app->tensorConv);
   printMetric("5. Transpose [tensor_transform]",
       "HWC -> CHW layout for Ara-2", app->transpose);
-  printMetric("6a. Tensor Transform #1 [typecast + add]",
-      "uint8->int16 + add -128", app->tensorShift1);
-  printMetric("6b. Tensor Transform #2 [typecast]",
-      "int16->int8", app->tensorShift2);
+  printMetric("6. Tensor Shift [typecast + add]",
+      "uint8->int8 + add -128 (XOR 0x80 equivalent)", app->tensorShift);
 
   if (app->preprocTotal.count > 0) {
     printf("\n  >> PREPROCESSING TOTAL\n");
@@ -343,7 +337,7 @@ static void printTiming(void *userData)
   printf("\n  2. Sum of Stages\n");
   printf("     +-----------------------------------------------------------"
          "----+\n");
-  printf("     | Preprocessing (G2D->tensorShift2):          %7.3f ms"
+  printf("     | Preprocessing (G2D->letterbox->shift):      %7.3f ms"
          "          |\n",
       sumPreproc);
   printf("     | Inference (Ara-2 NPU):                     %7.3f ms"
@@ -483,6 +477,11 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     app->scoresScale = scores_qp.scale;
     app->boxesScale = boxes_qp.scale;
     app->quantInitialized = true;
+
+    log_info("Scores quant: scale=%g zero_point=%" G_GINT64_FORMAT "\n",
+             scores_qp.scale, scores_qp.zeroPoint);
+    log_info("Boxes  quant: scale=%g zero_point=%" G_GINT64_FORMAT "\n",
+             boxes_qp.scale, boxes_qp.zeroPoint);
   }
 
   const uint8_t *scores = (const uint8_t *)score_map.data;
@@ -518,10 +517,11 @@ newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     float bw = boxes[2 * NUM_TOTAL_BOXES + bIdx] * app->boxesScale;
     float bh = boxes[3 * NUM_TOTAL_BOXES + bIdx] * app->boxesScale;
 
-    float px = (cx - app->letterboxParams.padX) / app->letterboxParams.scale;
-    float py = (cy - app->letterboxParams.padY) / app->letterboxParams.scale;
-    float pw = bw / app->letterboxParams.scale;
-    float ph = bh / app->letterboxParams.scale;
+    /* Letterbox reverse mapping: model pixel coords -> source coords */
+    float px = (cx - app->letterbox.padX) / app->letterbox.scale;
+    float py = (cy - app->letterbox.padY) / app->letterbox.scale;
+    float pw = bw / app->letterbox.scale;
+    float ph = bh / app->letterbox.scale;
 
     Detection det;
     det.x = px - pw / 2.0f;
@@ -647,8 +647,7 @@ static void installProbes(GstElement *pipeline, AppData *app)
     {"colorconv", "src", colorconvSrcProbe},
     {"tconv", "src", tensorconvSrcProbe},
     {"transpose", "src", transposeSrcProbe},
-    {"tshift1", "src", tshift1SrcProbe},
-    {"tshift2", "src", tshift2SrcProbe},
+    {"tagg", "src", tshiftSrcProbe},
   };
 
   for (auto &p : probes) {
@@ -677,53 +676,59 @@ static char *buildPipeline(Platform platform, const ParsedArgs &pargs,
   InputSource srcType = determineInputSource(pargs, plat.usesLibcamerasrc);
   char *srcStr = buildSourceElement(srcType, pargs);
 
-  // For display mode, wrap source with tee (except headless)
-  std::string source;
-  if (headless) {
-    char *s = g_strdup_printf("%s ! queue name=thread-nn leaky=2 max-size-buffers=2", srcStr);
-    source = s;
-    g_free(s);
-  } else {
-    char *s = g_strdup_printf("%s ! tee name=t "
-        "t. ! queue name=thread-nn leaky=2 max-size-buffers=2", srcStr);
-    source = s;
-    g_free(s);
-  }
-  g_free(srcStr);
-
-  // NN branch: preprocessing + inference + sink
-  char *nnBranch = g_strdup_printf(
-      "%s ! "
-      "imxvideoconvert_g2d name=g2d_scale ! video/x-raw,width=%d,height=%d,format=RGBA ! "
-      "videobox name=letterbox left=%d right=%d top=%d bottom=%d fill=black ! "
-      "videoconvert name=colorconv ! video/x-raw,format=RGB ! "
-      "tensor_converter name=tconv ! "
-      "tensor_transform name=transpose mode=transpose option=1:2:0:3 ! "
-      "tensor_transform name=tshift1 mode=arithmetic "
-      "option=typecast:int16,add:-128 ! "
-      "tensor_transform name=tshift2 mode=typecast option=int8 ! "
-      "tensor_filter name=tfilter framework=ara2 model=%s "
-      "custom=EnableStats:true latency=1 ! "
-      "tensor_sink name=inferenceOutput",
-      source.c_str(),
-      lb.scaledW, lb.scaledH,
-      -lb.padX, -lb.padRight, -lb.padY, -lb.padBottom,
-      pargs.model.c_str());
-
+  // NN branch: G2D aspect-fit resize + videobox letterbox padding + preprocessing + inference + sink
   char *pipeline;
   if (headless) {
-    pipeline = nnBranch;
+    pipeline = g_strdup_printf(
+        "%s ! queue name=thread-nn leaky=2 max-size-buffers=2 ! "
+        "imxvideoconvert_g2d name=g2d_scale ! "
+        "video/x-raw,width=%d,height=%d,format=RGBA ! "
+        "videobox name=letterbox left=%d right=%d top=%d bottom=%d fill=black ! "
+        "videoconvert name=colorconv ! video/x-raw,format=RGB ! "
+        "tensor_converter name=tconv ! "
+        "other/tensor,format=static,dimension=3:%d:%d:1,type=uint8 ! "
+        "tensor_transform name=transpose mode=transpose option=1:2:0:3 ! "
+        "tensor_transform name=tshift mode=arithmetic "
+        "option=typecast:int8,add:-128 ! "
+        "tensor_aggregator name=tagg frames-in=1 frames-out=1 frames-flush=1 ! "
+        "tensor_filter name=tfilter framework=ara2 model=%s "
+        "custom=EnableStats:true latency=1 ! "
+        "tensor_sink name=inferenceOutput",
+        srcStr,
+        lb.scaledW, lb.scaledH,
+        -lb.padX, -lb.padRight, -lb.padY, -lb.padBottom,
+        MODEL_INPUT_SIZE, MODEL_INPUT_SIZE,
+        pargs.model.c_str());
   } else {
     const char *syncMode = (!pargs.video.empty() || !pargs.image.empty()) ? "true" : "false";
     pipeline = g_strdup_printf(
-        "%s "
+        "%s ! tee name=t "
+        "t. ! queue name=thread-nn leaky=2 max-size-buffers=2 ! "
+        "imxvideoconvert_g2d name=g2d_scale ! "
+        "video/x-raw,width=%d,height=%d,format=RGBA ! "
+        "videobox name=letterbox left=%d right=%d top=%d bottom=%d fill=black ! "
+        "videoconvert name=colorconv ! video/x-raw,format=RGB ! "
+        "tensor_converter name=tconv ! "
+        "other/tensor,format=static,dimension=3:%d:%d:1,type=uint8 ! "
+        "tensor_transform name=transpose mode=transpose option=1:2:0:3 ! "
+        "tensor_transform name=tshift mode=arithmetic "
+        "option=typecast:int8,add:-128 ! "
+        "tensor_aggregator name=tagg frames-in=1 frames-out=1 frames-flush=1 ! "
+        "tensor_filter name=tfilter framework=ara2 model=%s "
+        "custom=EnableStats:true latency=1 ! "
+        "tensor_sink name=inferenceOutput "
         "t. ! queue name=thread-img max-size-buffers=2 ! "
         "imxvideoconvert_g2d ! "
         "cairooverlay name=cairo ! "
         "waylandsink sync=%s",
-        nnBranch, syncMode);
-    g_free(nnBranch);
+        srcStr,
+        lb.scaledW, lb.scaledH,
+        -lb.padX, -lb.padRight, -lb.padY, -lb.padBottom,
+        MODEL_INPUT_SIZE, MODEL_INPUT_SIZE,
+        pargs.model.c_str(),
+        syncMode);
   }
+  g_free(srcStr);
 
   return pipeline;
 }
@@ -795,27 +800,26 @@ int main(int argc, char **argv)
   if (pargs.headless)
     log_info("Mode: headless (no display)\n");
 
-  /* Letterbox */
+  // Calculate letterbox
   LetterboxParams lb = calculateLetterbox(SOURCE_WIDTH, SOURCE_HEIGHT);
   log_info("Letterbox: %dx%d -> scale %.4f -> %dx%d + pad L=%d R=%d T=%d B=%d\n",
-      SOURCE_WIDTH, SOURCE_HEIGHT, lb.scale, lb.scaledW, lb.scaledH,
-      lb.padX, lb.padRight, lb.padY, lb.padBottom);
+           SOURCE_WIDTH, SOURCE_HEIGHT, lb.scale, lb.scaledW, lb.scaledH,
+           lb.padX, lb.padRight, lb.padY, lb.padBottom);
 
   /* Build pipeline */
   char *pipelineStr = buildPipeline(platform, pargs, lb, pargs.headless);
   log_info("Pipeline: %s\n\n", pipelineStr);
 
   AppData app = {};
+  app.letterbox = lb;
   app.headless = pargs.headless;
-  app.letterboxParams = lb;
   app.maxFrames = pargs.numFrames;
   app.g2dScale.reset();
-  app.letterbox.reset();
+  app.letterboxTime.reset();
   app.colorconv.reset();
   app.tensorConv.reset();
   app.transpose.reset();
-  app.tensorShift1.reset();
-  app.tensorShift2.reset();
+  app.tensorShift.reset();
   app.preprocTotal.reset();
   app.inference.reset();
   app.outputMmap.reset();
