@@ -89,6 +89,7 @@ add_executable(yolov8n_ara2
 target_link_libraries(yolov8n_ara2
   ${GSTREAMER_LIBRARIES}
   ${GST_ALLOC_LIBRARIES}
+  ${CAIRO_LIBRARIES}
   ${NNSTREAMER_LIBRARIES}
   edgefirst_hal
 )
@@ -102,5 +103,6 @@ add_executable(yolov8n_ara2_reference
 )
 target_link_libraries(yolov8n_ara2_reference
   ${GSTREAMER_LIBRARIES}
+  ${CAIRO_LIBRARIES}
   ${NNSTREAMER_LIBRARIES}
 )
