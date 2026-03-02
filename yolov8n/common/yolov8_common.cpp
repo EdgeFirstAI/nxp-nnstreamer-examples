@@ -341,8 +341,12 @@ char *buildSourceElement(InputSource source, const ParsedArgs &args,
 {
   switch (source) {
     case INPUT_IMAGE:
+      // Use videoscale+videoconvert (software) before imagefreeze so the
+      // repeated frames are in system memory.  imxvideoconvert_g2d (HW)
+      // before imagefreeze produces DMA-BUF backed buffers that imagefreeze
+      // cannot re-negotiate with downstream HW elements on i.MX 8M Plus.
       return g_strdup_printf(
-          "filesrc location=%s ! jpegdec ! imxvideoconvert_g2d ! "
+          "filesrc location=%s ! jpegdec ! videoscale ! videoconvert ! "
           "video/x-raw,format=NV12,width=%d,height=%d ! imagefreeze",
           args.image.c_str(), srcWidth, srcHeight);
 

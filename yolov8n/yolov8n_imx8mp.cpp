@@ -500,7 +500,7 @@ int main(int argc, char **argv)
         "%s ! tee name=t "
         "t. ! %s "
         "t. ! queue name=thread-img max-size-buffers=2 ! "
-        "imxvideoconvert_g2d ! video/x-raw,format=RGBA ! "
+        "imxvideoconvert_g2d ! "
         "cairooverlay name=cairo ! "
         "waylandsink sync=%s",
         srcStr, nnBranch,
