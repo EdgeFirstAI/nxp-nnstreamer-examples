@@ -15,6 +15,7 @@
 #include <vector>
 
 
+
 /* ─── COCO class names ────────────────────────────────────────────── */
 
 const char *cocoClassNames[NUM_CLASSES] = {
@@ -131,6 +132,10 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
     opts.push_back({"speed", required_argument, 0, 's'});
     shortOpts += "s:";
   }
+  if (supportedFlags & ARG_SEG) {
+    opts.push_back({"seg", no_argument, 0, 'S'});
+    shortOpts += "S";
+  }
 
   // Sentinel
   opts.push_back({0, 0, 0, 0});
@@ -164,6 +169,8 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
           std::cout << "  -I, --instrumented      Enable detailed timing breakdown\n";
         if (supportedFlags & ARG_NUM_FRAMES)
           std::cout << "  -n, --num-frames N      Stop after N frames (0=infinite, default=0)\n";
+        if (supportedFlags & ARG_SEG)
+          std::cout << "  -S, --seg               Instance segmentation mode (YOLOv8-seg model)\n";
         return 1;
       }
       case 'm': args.model = optarg; break;
@@ -175,6 +182,7 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
       case 'n': args.numFrames = atoi(optarg); break;
       case 's': args.speed = atof(optarg); break;
       case 'p': args.platformStr = optarg; break;
+      case 'S': args.segmentation = true; break;
       case '?':
         return -1;
     }

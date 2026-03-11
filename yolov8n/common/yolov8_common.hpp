@@ -29,6 +29,13 @@
 #define NUM_COORDINATES     4         // Bounding box attributes (cx, cy, w, h)
 #define NUM_CLASSES         80        // COCO class count
 
+/* ─── Segmentation model constants ───────────────────────────────── */
+
+#define MODEL_SEG_OUTPUT_WIDTH  116   // 4 bbox + 80 classes + 32 mask coefficients
+#define MODEL_SEG_NUM_PROTOS    32    // Prototype mask channels
+#define MODEL_SEG_PROTO_DIM     160   // Prototype mask spatial dimension
+#define MODEL_SEG_NUM_OUTPUTS   4     // Split output tensors (classes, protos, bbox, coeffs)
+
 /* ─── Post-processing thresholds ──────────────────────────────────── */
 
 #define CONF_THRESHOLD      0.25f
@@ -130,6 +137,7 @@ enum ArgFlag {
   ARG_NUM_FRAMES   = (1u << 6),
   ARG_PLATFORM     = (1u << 7),
   ARG_SPEED        = (1u << 8),
+  ARG_SEG          = (1u << 9),
 };
 
 /** @brief Parsed CLI arguments */
@@ -143,6 +151,7 @@ struct ParsedArgs {
   bool instrumented = false;
   int numFrames = 0;
   double speed = 1.0;
+  bool segmentation = false;
 };
 
 /**
@@ -212,6 +221,22 @@ struct PtsTracker {
   bool consumeStart(GstBuffer *buffer, struct timeval &startTime);
 };
 
+
+/* ─── Segmentation Overlay Context ────────────────────────────────── */
+
+struct hal_image_processor;
+struct hal_tensor_image;
+
+/** @brief Context for GPU-accelerated segmentation mask overlay rendering */
+struct SegContext {
+  hal_image_processor *processor;   // GPU image processor
+  hal_tensor_image *overlay;        // PBO-backed RGBA overlay image
+  GMutex mutex;                     // Protects overlay between NN and draw threads
+  bool overlayReady;                // True when overlay has been rendered
+  bool segMode;                     // True when seg model detected at runtime
+  int overlayWidth;
+  int overlayHeight;
+};
 
 /* ─── Inference Latency Query ─────────────────────────────────────── */
 

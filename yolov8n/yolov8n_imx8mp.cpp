@@ -50,14 +50,78 @@
 
 #define DEFAULT_CAMERA_DEVICE "/dev/video3"
 
+
+/* ─── Segmentation Context (HAL-dependent, imx8mp only) ──────────── */
+
+static void initSegContext(SegContext &ctx, int width, int height) {
+  ctx.processor = hal_image_processor_new();
+  if (!ctx.processor) {
+    g_printerr("Failed to create HAL image processor\n");
+    return;
+  }
+  ctx.overlay = hal_image_processor_create_image(ctx.processor,
+                                                  width, height,
+                                                  HAL_FOURCC_RGBA);
+  if (!ctx.overlay) {
+    g_printerr("Failed to create PBO overlay image %dx%d\n", width, height);
+    hal_image_processor_free(ctx.processor);
+    ctx.processor = NULL;
+    return;
+  }
+  g_mutex_init(&ctx.mutex);
+  ctx.overlayReady = false;
+  ctx.segMode = false;
+  ctx.overlayWidth = width;
+  ctx.overlayHeight = height;
+}
+
+static void freeSegContext(SegContext &ctx) {
+  if (ctx.overlay) {
+    hal_tensor_image_free(ctx.overlay);
+    ctx.overlay = NULL;
+  }
+  if (ctx.processor) {
+    hal_image_processor_free(ctx.processor);
+    ctx.processor = NULL;
+  }
+  g_mutex_clear(&ctx.mutex);
+}
+
 // HAL JSON template — quantization filled from GstNnsTensorQuantMeta at runtime
-static const char *HAL_CONFIG_FMT =
+// Detection-only model: single [1, 84, 8400] output
+static const char *HAL_DET_CONFIG_FMT =
     "{\"outputs\":[{\"decoder\":\"ultralytics\","
     "\"type\":\"detection\","
     "\"shape\":[1,84,8400],"
     "\"quantization\":[%g,%" G_GINT64_FORMAT "],"
     "\"dshape\":[[\"batch\",1],[\"num_features\",84],[\"num_boxes\",8400]]}],"
     "\"nms\":\"class_agnostic\"}";
+
+// Segmentation model: 4 split outputs (scores, protos, boxes, mask_coefficients)
+// NNStreamer output order for yolov8n-seg split model:
+//   mem[0]: scores   [1, 80, 8400]      INT8
+//   mem[1]: protos   [1, 160, 160, 32]  INT8
+//   mem[2]: boxes    [1, 4, 8400]       INT8
+//   mem[3]: coeffs   [1, 32, 8400]      INT8
+static const char *HAL_SEG_CONFIG_FMT =
+    "{\"outputs\":["
+    "{\"decoder\":\"ultralytics\",\"type\":\"scores\","
+    "\"shape\":[1,80,8400],"
+    "\"dshape\":[[\"batch\",1],[\"num_classes\",80],[\"num_boxes\",8400]],"
+    "\"quantization\":[%g,%" G_GINT64_FORMAT "]},"
+    "{\"decoder\":\"ultralytics\",\"type\":\"protos\","
+    "\"shape\":[1,160,160,32],"
+    "\"dshape\":[[\"batch\",1],[\"height\",160],[\"width\",160],[\"num_protos\",32]],"
+    "\"quantization\":[%g,%" G_GINT64_FORMAT "]},"
+    "{\"decoder\":\"ultralytics\",\"type\":\"boxes\","
+    "\"shape\":[1,4,8400],"
+    "\"dshape\":[[\"batch\",1],[\"box_coords\",4],[\"num_boxes\",8400]],"
+    "\"quantization\":[%g,%" G_GINT64_FORMAT "]},"
+    "{\"decoder\":\"ultralytics\",\"type\":\"mask_coefficients\","
+    "\"shape\":[1,32,8400],"
+    "\"dshape\":[[\"batch\",1],[\"num_protos\",32],[\"num_boxes\",8400]],"
+    "\"quantization\":[%g,%" G_GINT64_FORMAT "]}"
+    "],\"nms\":\"class_agnostic\"}";
 
 
 /* ─── Timing statistics ───────────────────────────────────────────── */
@@ -72,7 +136,8 @@ typedef struct {
   TimingMetric inference;
 
   // Post-processing (HAL decoder)
-  TimingMetric halDecode;      // HAL decoder (quantized NMS)
+  TimingMetric halDecode;      // HAL decoder (quantized NMS) — det mode
+  TimingMetric halDrawMasks;   // HAL decoder draw_masks (fused decode+render) — seg mode
   TimingMetric postprocTotal;
 
   // Rendering
@@ -120,6 +185,10 @@ typedef struct {
 
   // HAL decoder
   hal_decoder *decoder;
+  bool decoderInitFailed;
+
+  // Segmentation overlay
+  SegContext seg;
 
   // Frame counting
   int numFrames;
@@ -211,10 +280,15 @@ static void printTimingStatistics(void *userData)
   }
 
   printf("\n==============================================================================\n");
-  printf("\n  POST-PROCESSING (EdgeFirst HAL — quantized NMS, no dequantization)\n");
+  if (app->seg.segMode)
+    printf("\n  POST-PROCESSING (EdgeFirst HAL — segmentation + quantized NMS)\n");
+  else
+    printf("\n  POST-PROCESSING (EdgeFirst HAL — quantized NMS, no dequantization)\n");
   printf("  --------------------------------------------------------------------------\n");
   printMetric("HAL decoder (dequant + NMS in one call)",
               "operates on INT8 tensors directly", app->timing.halDecode);
+  printMetric("HAL draw_masks (fused decode + GPU mask render)",
+              "PBO-accelerated segmentation overlay", app->timing.halDrawMasks);
   if (app->timing.postprocTotal.count > 0) {
     printf("\n  >> POST-PROCESSING TOTAL\n");
     printf("     Average: %7.3f ms  |  Min: %7.3f ms  |  Max: %7.3f ms\n",
@@ -271,6 +345,8 @@ static void printTimingStatistics(void *userData)
   printf("  * G2D keep-ratio=true: HW letterbox to delegate DMA-BUF\n");
   printf("  * CameraAdaptor:rgba: NPU handles RGBA->RGB + UINT8->INT8\n");
   printf("  * EdgeFirst HAL: quantized NMS (no CPU dequantization)\n");
+  if (app->seg.segMode)
+    printf("  * EdgeFirst HAL: GPU-accelerated segmentation mask overlay (PBO)\n");
   printf("  * Eliminated: videobox, videoconvert, tensor_transform #1 & #2\n");
   printf("\n==============================================================================\n");
 }
@@ -294,21 +370,59 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   // Validate buffer
   if (!GST_IS_BUFFER(buffer)) { log_error("Invalid buffer\n"); return; }
   guint n_mem = gst_buffer_n_memory(buffer);
-  if (n_mem != 1) { log_error("Expected 1 tensor, got %u\n", n_mem); return; }
+
+  // Accept 1 (det) or 4 (seg) output tensors
+  if (n_mem != 1 && n_mem != MODEL_SEG_NUM_OUTPUTS) {
+    log_error("Expected 1 or %d tensors, got %u\n", MODEL_SEG_NUM_OUTPUTS, n_mem);
+    return;
+  }
+
+  // Auto-detect seg mode on first buffer
+  bool isSeg = (n_mem == MODEL_SEG_NUM_OUTPUTS && app->seg.processor != NULL);
+  if (!app->seg.segMode && isSeg) {
+    app->seg.segMode = true;
+    log_info("Segmentation model detected (%u output tensors)\n", n_mem);
+  }
 
   // Lazy HAL decoder init — extract quant params from GstNnsTensorQuantMeta
-  if (!app->decoder) {
-    QuantParams qp;
-    if (!extractQuantParams(buffer, 0, qp)) {
-      log_error("No quant meta on output buffer — requires updated NNStreamer\n");
-      return;
-    }
-    log_info("Quant meta: scale=%g zero_point=%" G_GINT64_FORMAT "\n",
-             qp.scale, qp.zeroPoint);
+  if (!app->decoder && !app->decoderInitFailed) {
+    gchar *json = NULL;
 
-    gchar *json = g_strdup_printf(HAL_CONFIG_FMT, qp.scale, qp.zeroPoint);
+    if (isSeg) {
+      // Seg model: 4 split outputs, each with own quantization
+      QuantParams qp[MODEL_SEG_NUM_OUTPUTS];
+      for (guint i = 0; i < MODEL_SEG_NUM_OUTPUTS; i++) {
+        if (!extractQuantParams(buffer, i, qp[i])) {
+          log_error("No quant meta for output tensor %u — requires updated NNStreamer\n", i);
+          return;
+        }
+        log_info("Output[%u] quant: scale=%g zero_point=%" G_GINT64_FORMAT "\n",
+                 i, qp[i].scale, qp[i].zeroPoint);
+      }
+      json = g_strdup_printf(HAL_SEG_CONFIG_FMT,
+                              qp[0].scale, qp[0].zeroPoint,   // classes
+                              qp[1].scale, qp[1].zeroPoint,   // protos
+                              qp[2].scale, qp[2].zeroPoint,   // bbox
+                              qp[3].scale, qp[3].zeroPoint);  // coefficients
+    } else {
+      // Det model: single output
+      QuantParams qp;
+      if (!extractQuantParams(buffer, 0, qp)) {
+        log_error("No quant meta on output buffer — requires updated NNStreamer\n");
+        return;
+      }
+      log_info("Quant meta: scale=%g zero_point=%" G_GINT64_FORMAT "\n",
+               qp.scale, qp.zeroPoint);
+      json = g_strdup_printf(HAL_DET_CONFIG_FMT, qp.scale, qp.zeroPoint);
+    }
+
+    log_info("HAL config JSON: %s\n", json);
+
     hal_decoder_params *params = hal_decoder_params_new();
-    hal_decoder_params_set_config_json(params, json, 0);
+    int jsonRet = hal_decoder_params_set_config_json(params, json, 0);
+    if (jsonRet != 0) {
+      log_error("hal_decoder_params_set_config_json failed (%d)\n", jsonRet);
+    }
     hal_decoder_params_set_score_threshold(params, CONF_THRESHOLD);
     hal_decoder_params_set_iou_threshold(params, NMS_IOU_THRESHOLD);
     hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
@@ -317,43 +431,94 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     g_free(json);
 
     if (!app->decoder) {
-      log_error("Failed to create HAL decoder\n");
+      log_error("Failed to create HAL decoder (config: %s)\n", isSeg ? "seg" : "det");
+      app->decoderInitFailed = true;
       return;
     }
-    log_info("HAL decoder: created successfully\n");
+    log_info("HAL decoder: created (%s mode)\n", isSeg ? "segmentation" : "detection");
   }
 
-  // Map output tensor
-  // NOTE: With DMA-BUF V2 path, we must keep the mapping valid while reading
-  GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
-  GstMapInfo info;
-  if (!gst_memory_map(mem, &info, GST_MAP_READ)) {
-    log_error("Can't map output tensor\n");
-    return;
+  if (!app->decoder) return;
+
+  // Map all output tensors
+  GstMapInfo mapInfos[MODEL_SEG_NUM_OUTPUTS] = {};
+  bool mapped[MODEL_SEG_NUM_OUTPUTS] = {};
+  for (guint i = 0; i < n_mem; i++) {
+    GstMemory *mem = gst_buffer_peek_memory(buffer, i);
+    if (!gst_memory_map(mem, &mapInfos[i], GST_MAP_READ)) {
+      log_error("Can't map output tensor %u\n", i);
+      for (guint j = 0; j < i; j++)
+        if (mapped[j]) gst_memory_unmap(gst_buffer_peek_memory(buffer, j), &mapInfos[j]);
+      return;
+    }
+    mapped[i] = true;
   }
 
-  // Create HAL tensor — single [1, 84, 8400] INT8 tensor
-  size_t shape[] = {1, MODEL_OUTPUT_WIDTH, NUM_TOTAL_BOXES};
-  hal_tensor *hal_out = hal_tensor_new(HAL_DTYPE_I8, shape, 3,
-                                        HAL_TENSOR_MEMORY_MEM, NULL);
+  // Create HAL tensors
+  hal_tensor *hal_tensors[MODEL_SEG_NUM_OUTPUTS] = {};
   hal_detect_box_list *boxes = NULL;
 
-  if (hal_out) {
-    hal_tensor_map *tmap = hal_tensor_map_create(hal_out);
+  // Seg model output shapes (matching NNStreamer output order)
+  static const size_t seg_shapes[][4] = {
+    {1, NUM_CLASSES, NUM_TOTAL_BOXES, 0},             // [0] classes: [1,80,8400]
+    {1, MODEL_SEG_PROTO_DIM, MODEL_SEG_PROTO_DIM,     // [1] protos:  [1,160,160,32]
+     MODEL_SEG_NUM_PROTOS},
+    {1, NUM_COORDINATES, NUM_TOTAL_BOXES, 0},          // [2] bbox:    [1,4,8400]
+    {1, MODEL_SEG_NUM_PROTOS, NUM_TOTAL_BOXES, 0},     // [3] coeffs:  [1,32,8400]
+  };
+  static const size_t seg_ndims[] = {3, 4, 3, 3};
+
+  // Det model output shape
+  static const size_t det_shape[] = {1, MODEL_OUTPUT_WIDTH, NUM_TOTAL_BOXES};
+
+  bool tensorsOk = true;
+  for (guint i = 0; i < n_mem; i++) {
+    const size_t *shape = isSeg ? seg_shapes[i] : det_shape;
+    size_t ndim = isSeg ? seg_ndims[i] : 3;
+    hal_tensors[i] = hal_tensor_new(HAL_DTYPE_I8, shape, ndim,
+                                     HAL_TENSOR_MEMORY_MEM, NULL);
+    if (!hal_tensors[i]) { tensorsOk = false; break; }
+
+    hal_tensor_map *tmap = hal_tensor_map_create(hal_tensors[i]);
     if (tmap) {
       void *dst = hal_tensor_map_data(tmap);
-      if (dst)
-        memcpy(dst, info.data, info.size);
+      if (dst) memcpy(dst, mapInfos[i].data, mapInfos[i].size);
       hal_tensor_map_unmap(tmap);
     }
+  }
 
+  if (tensorsOk) {
     gettimeofday(&halStart, NULL);
 
-    const hal_tensor *outputs[] = {hal_out};
-    int ret = hal_decoder_decode(app->decoder, outputs, 1, &boxes, NULL);
+    const hal_tensor *outputs[MODEL_SEG_NUM_OUTPUTS];
+    for (guint i = 0; i < n_mem; i++)
+      outputs[i] = hal_tensors[i];
 
-    gettimeofday(&halEnd, NULL);
-    app->timing.halDecode.record(timeDiffMs(halStart, halEnd));
+    int ret;
+    if (isSeg && !app->headless && app->seg.overlay) {
+      // Seg display: fused decode + GPU mask rendering
+      g_mutex_lock(&app->seg.mutex);
+      ret = hal_decoder_draw_masks(app->decoder, app->seg.processor,
+                                    outputs, n_mem,
+                                    app->seg.overlay, &boxes);
+      app->seg.overlayReady = (ret == 0);
+      g_mutex_unlock(&app->seg.mutex);
+
+      gettimeofday(&halEnd, NULL);
+      app->timing.halDrawMasks.record(timeDiffMs(halStart, halEnd));
+    } else if (isSeg && app->headless) {
+      // Seg headless: decode only (metrics, no rendering)
+      ret = hal_decoder_decode(app->decoder, outputs, n_mem, &boxes, NULL);
+
+      gettimeofday(&halEnd, NULL);
+      app->timing.halDecode.record(timeDiffMs(halStart, halEnd));
+    } else {
+      // Det mode: unchanged
+      ret = hal_decoder_decode(app->decoder, outputs, n_mem, &boxes, NULL);
+
+      gettimeofday(&halEnd, NULL);
+      app->timing.halDecode.record(timeDiffMs(halStart, halEnd));
+    }
 
     if (ret == 0 && boxes) {
       size_t num_dets = hal_detect_box_list_len(boxes);
@@ -384,11 +549,13 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
 
     if (boxes)
       hal_detect_box_list_free(boxes);
-    hal_tensor_free(hal_out);
   }
 
-  // Unmap output tensor — all reads done
-  gst_memory_unmap(mem, &info);
+  // Free HAL tensors and unmap GstMemory
+  for (guint i = 0; i < n_mem; i++) {
+    if (hal_tensors[i]) hal_tensor_free(hal_tensors[i]);
+    if (mapped[i]) gst_memory_unmap(gst_buffer_peek_memory(buffer, i), &mapInfos[i]);
+  }
 
   struct timeval postEnd;
   gettimeofday(&postEnd, NULL);
@@ -409,24 +576,60 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
 static void drawCallback(GstElement *, cairo_t *cr, guint64, guint64, gpointer user_data)
 {
   AppData *app = (AppData *)user_data;
-  if (app->results.empty()) return;
 
   struct timeval startTime, endTime;
   gettimeofday(&startTime, NULL);
 
-  cairo_set_source_rgb(cr, 0, 1, 0);
-  cairo_set_line_width(cr, 2.0);
+  if (app->seg.segMode && app->seg.overlay) {
+    // Seg mode: composite PBO overlay (HAL already drew masks + boxes)
+    g_mutex_lock(&app->seg.mutex);
+    if (app->seg.overlayReady) {
+      hal_tensor_map *tmap = hal_tensor_image_map_create(app->seg.overlay);
+      if (tmap) {
+        void *pixels = hal_tensor_map_data(tmap);
+        if (pixels) {
+          int w = app->seg.overlayWidth;
+          int h = app->seg.overlayHeight;
+          int stride = w * 4;  // RGBA = 4 bytes per pixel
 
-  for (auto &det : app->results) {
-    cairo_rectangle(cr, det.x, det.y, det.w, det.h);
-    cairo_move_to(cr, det.x + 5, det.y + 15);
-    const char *name = (det.classId >= 0 && det.classId < NUM_CLASSES)
-        ? cocoClassNames[det.classId] : "?";
-    char label[64];
-    snprintf(label, sizeof(label), "%s %.0f%%", name, det.score * 100);
-    cairo_show_text(cr, label);
+          // HAL writes RGBA, Cairo expects ARGB32 (BGRA on little-endian).
+          // In-place RGBA→BGRA byte swizzle for the overlay.
+          uint8_t *p = (uint8_t *)pixels;
+          for (int i = 0; i < w * h; i++) {
+            uint8_t r = p[0], g = p[1], b = p[2], a = p[3];
+            p[0] = b; p[1] = g; p[2] = r; p[3] = a;
+            p += 4;
+          }
+
+          cairo_surface_t *surf = cairo_image_surface_create_for_data(
+              (unsigned char *)pixels, CAIRO_FORMAT_ARGB32, w, h, stride);
+          if (cairo_surface_status(surf) == CAIRO_STATUS_SUCCESS) {
+            cairo_set_source_surface(cr, surf, 0, 0);
+            cairo_paint(cr);
+          }
+          cairo_surface_destroy(surf);
+        }
+        hal_tensor_map_unmap(tmap);
+      }
+      app->seg.overlayReady = false;
+    }
+    g_mutex_unlock(&app->seg.mutex);
+  } else if (!app->results.empty()) {
+    // Det mode: draw bounding boxes via Cairo (unchanged)
+    cairo_set_source_rgb(cr, 0, 1, 0);
+    cairo_set_line_width(cr, 2.0);
+
+    for (auto &det : app->results) {
+      cairo_rectangle(cr, det.x, det.y, det.w, det.h);
+      cairo_move_to(cr, det.x + 5, det.y + 15);
+      const char *name = (det.classId >= 0 && det.classId < NUM_CLASSES)
+          ? cocoClassNames[det.classId] : "?";
+      char label[64];
+      snprintf(label, sizeof(label), "%s %.0f%%", name, det.score * 100);
+      cairo_show_text(cr, label);
+    }
+    cairo_stroke(cr);
   }
-  cairo_stroke(cr);
 
   gettimeofday(&endTime, NULL);
   app->timing.cairoDraw.record(timeDiffMs(startTime, endTime));
@@ -441,7 +644,7 @@ int main(int argc, char **argv)
   pargs.camera = DEFAULT_CAMERA_DEVICE;
 
   uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO | ARG_IMAGE |
-                   ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES;
+                   ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES | ARG_SEG;
 
   int ret = parseArgs(argc, argv, flags,
       "YOLOv8n 640x640 for i.MX 8M Plus — EdgeFirst Optimized", pargs);
@@ -473,6 +676,8 @@ int main(int argc, char **argv)
   log_info("Framework: tensorflow2-lite (V2 invoke + DMA-BUF)\n");
   log_info("CameraAdaptor: rgba (NPU handles RGBA->RGB + UINT8->INT8)\n");
   log_info("Post-processing: EdgeFirst HAL (quantized NMS)\n");
+  if (pargs.segmentation)
+    log_info("Segmentation: enabled (GPU-accelerated mask overlay)\n");
   log_info("Letterbox: %dx%d -> scale %.4f -> %dx%d + pad L=%d R=%d T=%d B=%d\n",
            SOURCE_WIDTH, SOURCE_HEIGHT, lb.scale, lb.scaledW, lb.scaledH,
            lb.padX, lb.padRight, lb.padY, lb.padBottom);
@@ -522,18 +727,23 @@ int main(int argc, char **argv)
   app.timing.preprocTotal.reset();
   app.timing.inference.reset();
   app.timing.halDecode.reset();
+  app.timing.halDrawMasks.reset();
   app.timing.postprocTotal.reset();
   app.timing.cairoDraw.reset();
   app.timing.e2ePipeline.reset();
   app.throughput.reset();
   app.ptsTracker.init();
 
+  // Initialize seg context if --seg requested
+  if (pargs.segmentation)
+    initSegContext(app.seg, SOURCE_WIDTH, SOURCE_HEIGHT);
+
   bool startedOnce = false;
   app.busCtx.playing = &app.playing;
   app.busCtx.startedOnce = &startedOnce;
   app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
   app.busCtx.videoRate = 1.0;
-  app.busCtx.printTiming = printTimingStatistics;
+  app.busCtx.printTiming = NULL;  // print after pipeline teardown
   app.busCtx.appData = &app;
 
   // Create pipeline
@@ -601,13 +811,10 @@ int main(int argc, char **argv)
   gst_element_set_state(app.gstPipeline, GST_STATE_PLAYING);
   g_main_loop_run(app.loop);
 
-  // Print timing statistics (guard prevents double print)
+  // Cleanup — tear down pipeline first so waylandsink stats print before ours
+  gst_element_set_state(app.gstPipeline, GST_STATE_NULL);
   if (app.instrumented)
     printTimingStatistics(&app);
-
-
-  // Cleanup
-  gst_element_set_state(app.gstPipeline, GST_STATE_NULL);
   if (app.tensorFilter)
     gst_object_unref(app.tensorFilter);
   gst_object_unref(app.bus);
@@ -616,6 +823,8 @@ int main(int argc, char **argv)
   app.ptsTracker.destroy();
   if (app.decoder)
     hal_decoder_free(app.decoder);
+  if (app.seg.processor)
+    freeSegContext(app.seg);
 
   return 0;
 }
