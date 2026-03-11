@@ -446,7 +446,7 @@ int main(int argc, char **argv)
   if (pargs.numFrames > 0) {
     log_info("Frames: %d\n", pargs.numFrames);
   }
-  if (pargs.headless) log_info("Mode: headless (no display)\n");
+  log_info("Mode: %s\n", pargs.headless ? "headless" : "display");
 
   // Build source element
   InputSource srcType = determineInputSource(pargs, true);
@@ -502,7 +502,7 @@ int main(int argc, char **argv)
   app.busCtx.startedOnce = &startedOnce;
   app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
   app.busCtx.videoRate = 1.0;
-  app.busCtx.printTiming = printTimingStatistics;
+  app.busCtx.printTiming = NULL;  // print after pipeline teardown
   app.busCtx.appData = &app;
 
   // Create pipeline
@@ -547,12 +547,10 @@ int main(int argc, char **argv)
   gst_element_set_state(app.gstPipeline, GST_STATE_PLAYING);
   g_main_loop_run(app.loop);
 
-  // Print timing statistics on exit
+  // Cleanup — tear down pipeline first so waylandsink stats print before ours
+  gst_element_set_state(app.gstPipeline, GST_STATE_NULL);
   if (app.instrumented)
     printTimingStatistics(&app);
-
-  // Cleanup
-  gst_element_set_state(app.gstPipeline, GST_STATE_NULL);
   if (app.tensorFilter)
     gst_object_unref(app.tensorFilter);
   if (app.cameraadaptor)
