@@ -683,7 +683,7 @@ int main(int argc, char **argv)
   pargs.camera = "";  // Will be set from platform default
 
   uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO | ARG_IMAGE |
-                   ARG_HEADLESS | ARG_NUM_FRAMES | ARG_PLATFORM | ARG_SPEED;
+                   ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES | ARG_PLATFORM | ARG_SPEED;
 
   int ret = parseArgs(argc, argv, flags,
       "YOLOv8n 640x640 Reference Pipeline (standard NXP preprocessing)", pargs);
@@ -738,9 +738,7 @@ int main(int argc, char **argv)
   } else {
     log_info("Input: camera (%s)\n", pargs.camera.empty() ? "libcamerasrc" : pargs.camera.c_str());
   }
-  if (pargs.headless) {
-    log_info("Mode: headless (no display)\n");
-  }
+  log_info("Mode: %s\n", pargs.headless ? "headless" : "display");
 
   gst_init(&argc, &argv);
 
@@ -788,7 +786,7 @@ int main(int argc, char **argv)
   app.busCtx.startedOnce = &startedOnce;
   app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
   app.busCtx.videoRate = pargs.speed;
-  app.busCtx.printTiming = printTimingStatistics;
+  app.busCtx.printTiming = NULL;  // print after pipeline teardown
   app.busCtx.appData = &app;
 
   // Create pipeline
@@ -834,11 +832,9 @@ int main(int argc, char **argv)
   gst_element_set_state(app.gstPipeline, GST_STATE_PLAYING);
   g_main_loop_run(app.loop);
 
-  // Print timing statistics on exit
-  printTimingStatistics(&app);
-
-  // Cleanup
+  // Cleanup — tear down pipeline first so waylandsink stats print before ours
   gst_element_set_state(app.gstPipeline, GST_STATE_NULL);
+  printTimingStatistics(&app);
   if (app.tensorFilter)
     gst_object_unref(app.tensorFilter);
   gst_object_unref(app.bus);

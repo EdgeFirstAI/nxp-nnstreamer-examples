@@ -421,7 +421,6 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
         if (out_mapped[j])
           gst_memory_unmap(gst_buffer_peek_memory(buffer, j), &out_maps[j]);
       }
-      printTiming(app);
       g_main_loop_quit(app->loop);
       return;
     }
@@ -471,7 +470,7 @@ int main(int argc, char **argv)
   pargs.camera = "";  // Will be set from platform default
 
   uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO | ARG_IMAGE |
-                   ARG_HEADLESS | ARG_NUM_FRAMES | ARG_PLATFORM;
+                   ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES | ARG_PLATFORM;
 
   int ret = parseArgs(argc, argv, flags,
       "YOLOv8n 640x640 for Kinara Ara-2 NPU — EdgeFirst CameraAdaptor + HAL", pargs);
@@ -526,8 +525,7 @@ int main(int argc, char **argv)
   }
   if (pargs.numFrames > 0)
     log_info("Frames: %d\n", pargs.numFrames);
-  if (pargs.headless)
-    log_info("Mode: headless (no display)\n");
+  log_info("Mode: %s\n", pargs.headless ? "headless" : "display");
 
   // Build source element
   InputSource srcType = determineInputSource(pargs, plat.usesLibcamerasrc);
@@ -577,7 +575,7 @@ int main(int argc, char **argv)
   app.busCtx.startedOnce = pargs.headless ? NULL : &startedOnce;
   app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
   app.busCtx.videoRate = 1.0;
-  app.busCtx.printTiming = printTiming;
+  app.busCtx.printTiming = NULL;  // print after pipeline teardown
   app.busCtx.appData = &app;
 
   app.loop = g_main_loop_new(NULL, FALSE);
@@ -636,8 +634,9 @@ int main(int argc, char **argv)
   gst_element_set_state(app.pipeline, GST_STATE_PLAYING);
   g_main_loop_run(app.loop);
 
-  // Cleanup
+  // Cleanup — tear down pipeline first so waylandsink stats print before ours
   gst_element_set_state(app.pipeline, GST_STATE_NULL);
+  printTiming(&app);
   if (app.tensorFilter)
     gst_object_unref(app.tensorFilter);
   if (app.cameraadaptor)

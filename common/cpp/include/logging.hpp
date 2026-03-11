@@ -10,26 +10,25 @@
 #define LOG_INFO true
 
 #if LOG_INFO
-#define log_info(...) printf("\n\033[1;32mINFO:\033[0m "); printf(__VA_ARGS__); fflush(stdout);
-
-#else 
-#define log_info(...)
+#define log_info(...) do { printf("\n\033[1;32mINFO:\033[0m "); printf(__VA_ARGS__); fflush(stdout); } while(0)
+#else
+#define log_info(...) do { } while(0)
 #endif
 
 #define LOG_ERROR true
 
 #if LOG_ERROR
-#define log_error(...) printf("\n\033[1;31mERROR:\033[0m "); printf(__VA_ARGS__); fflush(stdout);
-#else 
-#define log_error(...)
+#define log_error(...) do { printf("\n\033[1;31mERROR:\033[0m "); printf(__VA_ARGS__); fflush(stdout); } while(0)
+#else
+#define log_error(...) do { } while(0)
 #endif
 
 #define LOG_DEBUG true
 
 #if LOG_DEBUG
-#define log_debug(...) printf("\n\033[1;33mDEBUG:\033[0m "); printf(__VA_ARGS__); fflush(stdout);
-#else 
-#define log_debug(...)
+#define log_debug(...) do { printf("\n\033[1;33mDEBUG:\033[0m "); printf(__VA_ARGS__); fflush(stdout); } while(0)
+#else
+#define log_debug(...) do { } while(0)
 #endif
 
 #endif
