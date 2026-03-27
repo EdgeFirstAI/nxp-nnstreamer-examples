@@ -61,7 +61,8 @@ static void initSegContext(SegContext &ctx, int width, int height) {
   }
   ctx.overlay = hal_image_processor_create_image(ctx.processor,
                                                   width, height,
-                                                  HAL_FOURCC_RGBA);
+                                                  HAL_PIXEL_FORMAT_RGBA,
+                                                  HAL_DTYPE_U8);
   if (!ctx.overlay) {
     g_printerr("Failed to create PBO overlay image %dx%d\n", width, height);
     hal_image_processor_free(ctx.processor);
@@ -77,7 +78,7 @@ static void initSegContext(SegContext &ctx, int width, int height) {
 
 static void freeSegContext(SegContext &ctx) {
   if (ctx.overlay) {
-    hal_tensor_image_free(ctx.overlay);
+    hal_tensor_free(ctx.overlay);
     ctx.overlay = NULL;
   }
   if (ctx.processor) {
@@ -584,7 +585,7 @@ static void drawCallback(GstElement *, cairo_t *cr, guint64, guint64, gpointer u
     // Seg mode: composite PBO overlay (HAL already drew masks + boxes)
     g_mutex_lock(&app->seg.mutex);
     if (app->seg.overlayReady) {
-      hal_tensor_map *tmap = hal_tensor_image_map_create(app->seg.overlay);
+      hal_tensor_map *tmap = hal_tensor_map_create(app->seg.overlay);
       if (tmap) {
         void *pixels = hal_tensor_map_data(tmap);
         if (pixels) {
