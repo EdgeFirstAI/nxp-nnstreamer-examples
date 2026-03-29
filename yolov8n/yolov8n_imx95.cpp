@@ -432,7 +432,7 @@ int main(int argc, char **argv)
 {
   ParsedArgs pargs;
   uint32_t flags = ARG_MODEL | ARG_VIDEO | ARG_IMAGE |
-                   ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES;
+                   ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES | ARG_COMPUTE;
 
   int ret = parseArgs(argc, argv, flags,
       "YOLOv8n 640x640 for i.MX 95 — EdgeFirst CameraAdaptor + HAL", pargs);
@@ -468,15 +468,16 @@ int main(int argc, char **argv)
   const char *syncMode = (srcType == INPUT_IMAGE || srcType == INPUT_VIDEO) ? "true" : "false";
 
   // Build NN processing branch
+  const char *computeStr = pargs.compute.empty() ? "auto" : pargs.compute.c_str();
   char *nnBranch = g_strdup_printf(
       "queue name=thread-nn leaky=2 max-size-buffers=2 ! "
       "edgefirstcameraadaptor name=preproc model-width=%d model-height=%d "
-      "model-dtype=int8 model-layout=hwc letterbox=true ! "
+      "model-dtype=int8 model-layout=hwc letterbox=true compute=%s ! "
       "tensor_filter name=tfilter framework=tensorflow-lite model=%s "
       "custom=Delegate:External,ExtDelegateLib:libneutron_delegate.so latency=1 ! "
       "tensor_sink name=inferenceOutput",
       MODEL_INPUT_SIZE, MODEL_INPUT_SIZE,
-      pargs.model.c_str());
+      computeStr, pargs.model.c_str());
 
   // Build full pipeline
   char *pipelineStr;

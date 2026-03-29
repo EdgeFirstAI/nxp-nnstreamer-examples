@@ -136,6 +136,10 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
     opts.push_back({"seg", no_argument, 0, 'S'});
     shortOpts += "S";
   }
+  if (supportedFlags & ARG_COMPUTE) {
+    opts.push_back({"compute", required_argument, 0, 'C'});
+    shortOpts += "C:";
+  }
 
   // Sentinel
   opts.push_back({0, 0, 0, 0});
@@ -171,6 +175,8 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
           std::cout << "  -n, --num-frames N      Stop after N frames (0=infinite, default=0)\n";
         if (supportedFlags & ARG_SEG)
           std::cout << "  -S, --seg               Instance segmentation mode (YOLOv8-seg model)\n";
+        if (supportedFlags & ARG_COMPUTE)
+          std::cout << "  -C, --compute BACKEND   edgefirstcameraadaptor backend: auto|opengl|g2d|cpu (default: auto)\n";
         return 1;
       }
       case 'm': args.model = optarg; break;
@@ -183,6 +189,7 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
       case 's': args.speed = atof(optarg); break;
       case 'p': args.platformStr = optarg; break;
       case 'S': args.segmentation = true; break;
+      case 'C': args.compute = optarg; break;
       case '?':
         return -1;
     }
