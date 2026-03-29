@@ -263,8 +263,13 @@ char *buildSourceElement(InputSource source, const ParsedArgs &args,
 
 /* ─── i.MX 95 Environment Setup ──────────────────────────────────── */
 
-/** @brief Set LIBCAMERA_PIPELINES_MATCH_LIST and NEUTRON_ENABLE_ZERO_COPY */
-void setupImx95Environment();
+/**
+ * @brief Set LIBCAMERA_PIPELINES_MATCH_LIST and NEUTRON_ENABLE_ZERO_COPY.
+ * @param neutron_zero_copy  Pass true for pipelines that use the NnsDmaBufInputPool
+ *                           (i.e. yolov8n_imx95 with edgefirstcameraadaptor).
+ *                           Pass false for all other pipelines.
+ */
+void setupImx95Environment(bool neutron_zero_copy);
 
 
 #endif // YOLOV8_COMMON_HPP

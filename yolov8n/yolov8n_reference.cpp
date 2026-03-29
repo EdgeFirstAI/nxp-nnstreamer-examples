@@ -723,7 +723,7 @@ int main(int argc, char **argv)
 
   // Platform-specific environment setup
   if (platform == PLATFORM_IMX95)
-    setupImx95Environment();
+    setupImx95Environment(false);
 
   log_info("YOLOv8n 640x640 Reference Pipeline — %s (%s)\n", plat.name, plat.npuName);
   log_info("Model: %s\n", pargs.model.c_str());
