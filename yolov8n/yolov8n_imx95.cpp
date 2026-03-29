@@ -444,7 +444,7 @@ int main(int argc, char **argv)
   }
 
   // Auto-set i.MX 95 environment
-  setupImx95Environment();
+  setupImx95Environment(true);
 
   gst_init(&argc, &argv);
 

@@ -510,7 +510,7 @@ int main(int argc, char **argv)
 
   // Platform-specific environment setup
   if (platform == PLATFORM_IMX95)
-    setupImx95Environment();
+    setupImx95Environment(false);
 
   gst_init(&argc, &argv);
 

@@ -386,15 +386,17 @@ char *buildSourceElement(InputSource source, const ParsedArgs &args,
 
 /* ─── i.MX 95 Environment Setup ──────────────────────────────────── */
 
-void setupImx95Environment() {
+void setupImx95Environment(bool neutron_zero_copy) {
   const char *pm = getenv("LIBCAMERA_PIPELINES_MATCH_LIST");
   if (!pm || strlen(pm) == 0) {
     g_print("Setting LIBCAMERA_PIPELINES_MATCH_LIST='nxp/neo,imx8-isi'\n");
     setenv("LIBCAMERA_PIPELINES_MATCH_LIST", "nxp/neo,imx8-isi", 1);
   }
-  const char *zc = getenv("NEUTRON_ENABLE_ZERO_COPY");
-  if (!zc) {
-    g_print("Setting NEUTRON_ENABLE_ZERO_COPY=0\n");
-    setenv("NEUTRON_ENABLE_ZERO_COPY", "0", 1);
-  }
+  /* Each pipeline hard-codes its zero-copy requirement: yolov8n_imx95 uses
+   * NnsDmaBufInputPool (edgefirstcameraadaptor writes to the Neutron DMA-BUF
+   * directly, so zero-copy must be enabled).  All other pipelines copy the
+   * tensor into Neutron's DMA-BUF internally. */
+  const char *val = neutron_zero_copy ? "1" : "0";
+  g_print("Setting NEUTRON_ENABLE_ZERO_COPY=%s\n", val);
+  setenv("NEUTRON_ENABLE_ZERO_COPY", val, 1);
 }
