@@ -225,12 +225,12 @@ struct PtsTracker {
 /* ─── Segmentation Overlay Context ────────────────────────────────── */
 
 struct hal_image_processor;
-struct hal_tensor_image;
+struct hal_tensor;
 
 /** @brief Context for GPU-accelerated segmentation mask overlay rendering */
 struct SegContext {
   hal_image_processor *processor;   // GPU image processor
-  hal_tensor_image *overlay;        // PBO-backed RGBA overlay image
+  hal_tensor *overlay;              // PBO-backed RGBA overlay tensor
   GMutex mutex;                     // Protects overlay between NN and draw threads
   bool overlayReady;                // True when overlay has been rendered
   bool segMode;                     // True when seg model detected at runtime

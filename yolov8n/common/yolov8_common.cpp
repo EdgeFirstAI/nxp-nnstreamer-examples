@@ -365,7 +365,7 @@ char *buildSourceElement(InputSource source, const ParsedArgs &args,
 
     case INPUT_CAMERA_LIBCAMERA:
       return g_strdup_printf(
-          "libcamerasrc ! video/x-raw,format=NV12,width=%d,height=%d",
+          "libcamerasrc ! video/x-raw,format=YUY2,width=%d,height=%d",
           srcWidth, srcHeight);
 
     case INPUT_CAMERA_V4L2:

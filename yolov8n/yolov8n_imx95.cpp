@@ -6,9 +6,9 @@
  * YOLOv8n 640x640 Camera Demo for i.MX 95 — EdgeFirst CameraAdaptor + HAL
  *
  * PREPROCESSING (1 element — edgefirstcameraadaptor):
- *   - NV12 → RGB color conversion (G2D/GPU hardware)
- *   - Resize + letterbox with grey fill (G2D/GPU hardware)
- *   - uint8 → int8 quantization shift (NEON XOR 0x80)
+ *   - HAL-managed pipeline: NV12 DMA-BUF → resize + letterbox + INT8 quantization
+ *   - Backend selected by HAL at runtime (OpenGL, G2D, or CPU); use
+ *     GST_DEBUG=edgefirst-hal:5 to see which backend was chosen
  *
  * INFERENCE: Neutron NPU via libneutron_delegate.so
  *
@@ -153,7 +153,21 @@ static void printTimingStatistics(void *userData)
   if (app->instrumented) {
     printf("\n  PREPROCESSING (edgefirstcameraadaptor — fused HAL pipeline)\n");
     printf("  --------------------------------------------------------------------------\n");
-    printf("     NV12 -> RGB + resize + letterbox (G2D/GPU) + uint8->int8 (NEON)\n");
+    /* Print compute backend only when explicitly configured (auto = HAL decides,
+     * actual selection visible via GST_DEBUG=edgefirst-hal:5) */
+    if (app->cameraadaptor) {
+      GParamSpec *pspec = g_object_class_find_property (
+          G_OBJECT_GET_CLASS (app->cameraadaptor), "compute");
+      if (pspec && G_IS_PARAM_SPEC_ENUM (pspec)) {
+        gint compute_val = 0;
+        g_object_get (app->cameraadaptor, "compute", &compute_val, NULL);
+        GEnumClass *eclass = G_PARAM_SPEC_ENUM (pspec)->enum_class;
+        GEnumValue *ev = eclass ? g_enum_get_value (eclass, compute_val) : NULL;
+        /* "auto" means HAL selects at runtime — don't guess the backend */
+        if (ev && g_strcmp0 (ev->value_nick, "auto") != 0)
+          printf("     Compute backend: %s\n", ev->value_name);
+      }
+    }
     if (app->timing.preproc.count > 0) {
       printf("     Average: %7.3f ms  |  Min: %7.3f ms  |  Max: %7.3f ms  [%d frames]\n",
              app->timing.preproc.avg(), app->timing.preproc.minMs,
