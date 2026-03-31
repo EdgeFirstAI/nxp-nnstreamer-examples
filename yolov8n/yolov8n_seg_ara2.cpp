@@ -223,6 +223,7 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps)
   hal_decoder_params_set_score_threshold(params, CONF_THRESHOLD);
   hal_decoder_params_set_iou_threshold(params, NMS_IOU_THRESHOLD);
   hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
+  hal_decoder_params_set_decoder_version(params, HAL_DECODER_VERSION_YOLOV8);
 
   for (int i = 0; i < app->tensor_count; i++) {
     size_t ndim = app->tensor_ndims[i];
