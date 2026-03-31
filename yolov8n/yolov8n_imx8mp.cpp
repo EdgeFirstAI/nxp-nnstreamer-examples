@@ -499,9 +499,16 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     if (isSeg && !app->headless && app->seg.overlay) {
       // Seg display: fused decode + GPU mask rendering
       g_mutex_lock(&app->seg.mutex);
-      ret = hal_decoder_draw_masks(app->decoder, app->seg.processor,
-                                    outputs, n_mem,
-                                    app->seg.overlay, &boxes);
+      float lb4[4] = {
+        (float)app->letterbox.padX / MODEL_INPUT_SIZE,
+        (float)app->letterbox.padY / MODEL_INPUT_SIZE,
+        (float)(MODEL_INPUT_SIZE - app->letterbox.padRight) / MODEL_INPUT_SIZE,
+        (float)(MODEL_INPUT_SIZE - app->letterbox.padBottom) / MODEL_INPUT_SIZE
+      };
+      ret = hal_image_processor_draw_masks(app->seg.processor, app->decoder,
+                                           outputs, n_mem,
+                                           app->seg.overlay, NULL, 0.5f,
+                                           lb4, HAL_COLOR_MODE_CLASS, &boxes);
       app->seg.overlayReady = (ret == 0);
       g_mutex_unlock(&app->seg.mutex);
 
