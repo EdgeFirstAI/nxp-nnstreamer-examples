@@ -124,3 +124,17 @@ target_link_libraries(yolov8n_seg
   ${EDGEFIRST_GST_LIBRARIES}
   edgefirst_hal
 )
+
+# --- yolov8n_seg_ara2 ---
+# Instance segmentation with Ara-2 NPU + EdgeFirst HAL decode_proto + materialize_masks.
+# tensor_sink callback with programmatic HAL decoder auto-config from NNStreamer caps.
+add_executable(yolov8n_seg_ara2
+  yolov8n_seg_ara2.cpp
+  ${COMMON_SRC}
+)
+target_link_libraries(yolov8n_seg_ara2
+  ${GSTREAMER_LIBRARIES}
+  ${GST_ALLOC_LIBRARIES}
+  ${NNSTREAMER_LIBRARIES}
+  edgefirst_hal
+)
