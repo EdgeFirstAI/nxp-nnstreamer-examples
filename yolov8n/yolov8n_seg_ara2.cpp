@@ -225,39 +225,48 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps)
   hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
 
   for (int i = 0; i < app->tensor_count; i++) {
-    size_t *shape = app->tensor_shapes[i];
     size_t ndim = app->tensor_ndims[i];
     hal_dtype dtype = app->tensor_dtypes[i];
+
+    /* Work with a local copy so we can rearrange for the HAL API.
+     * After squeeze, 2D shapes are [num_boxes, features].
+     * HAL expects [batch, features, num_boxes] for split outputs. */
+    size_t out_shape[8] = {};
+    memcpy(out_shape, app->tensor_shapes[i], ndim * sizeof(size_t));
 
     HalOutputType type;
     HalDimName dims[8];
 
     if (ndim == 3) {
-      /* Protos: [H, W, C] */
+      /* Protos: [H, W, C] — already correct */
       type = HAL_OUTPUT_TYPE_PROTOS;
       dims[0] = HAL_DIM_NAME_HEIGHT;
       dims[1] = HAL_DIM_NAME_WIDTH;
       dims[2] = HAL_DIM_NAME_NUM_PROTOS;
-    } else if (has_split_boxes) {
-      size_t feat_dim = shape[1];
+    } else if (has_split_boxes && ndim == 2) {
+      /* 2D tensor [num_boxes, features] → rearrange to [1, features, num_boxes] */
+      size_t num_boxes = out_shape[0];
+      size_t feat_dim = out_shape[1];
+      out_shape[0] = 1;
+      out_shape[1] = feat_dim;
+      out_shape[2] = num_boxes;
+      ndim = 3;
+
       if (feat_dim == 4) {
         type = HAL_OUTPUT_TYPE_BOXES;
         dims[0] = HAL_DIM_NAME_BATCH;
         dims[1] = HAL_DIM_NAME_BOX_COORDS;
         dims[2] = HAL_DIM_NAME_NUM_BOXES;
-        ndim = 3;
       } else if (has_protos && proto_channels > 0 && feat_dim == proto_channels) {
         type = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
         dims[0] = HAL_DIM_NAME_BATCH;
         dims[1] = HAL_DIM_NAME_NUM_PROTOS;
         dims[2] = HAL_DIM_NAME_NUM_BOXES;
-        ndim = 3;
       } else {
         type = HAL_OUTPUT_TYPE_SCORES;
         dims[0] = HAL_DIM_NAME_BATCH;
         dims[1] = HAL_DIM_NAME_NUM_CLASSES;
         dims[2] = HAL_DIM_NAME_NUM_BOXES;
-        ndim = 3;
       }
     } else {
       type = HAL_OUTPUT_TYPE_DETECTION;
@@ -273,7 +282,7 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps)
     }
 
     int idx = hal_decoder_params_add_output(params, type,
-        HAL_DECODER_TYPE_ULTRALYTICS, shape, dims, ndim);
+        HAL_DECODER_TYPE_ULTRALYTICS, out_shape, dims, ndim);
 
     /* Set quantization placeholder for non-float tensors.
      * Real quant params are extracted from GstNnsTensorQuantMeta below. */
