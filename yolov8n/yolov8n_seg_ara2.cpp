@@ -131,20 +131,33 @@ static hal_dtype nnstreamer_type_to_hal(const char *type_str)
   return HAL_DTYPE_F32;
 }
 
-/* Parse NNStreamer dim string "C:W:H:1" (innermost first) to shape[]
- * (row-major). Returns ndim. */
+/* Parse NNStreamer dim string "C:W:H:B" (innermost first) to shape[]
+ * (row-major). Strips trailing :1 dimensions, then squeezes interior
+ * unit dimensions (keeps min 2 dims). This handles Ara-2 DVM output
+ * like "32:1:8400:1" → [8400, 32] instead of [8400, 1, 32]. */
 static size_t parse_nnstreamer_dims(const char *dim_str, size_t *shape, size_t max_ndim)
 {
   gchar **parts = g_strsplit(dim_str, ":", (gint)max_ndim + 1);
   size_t n = 0;
   while (parts[n] && n < max_ndim) n++;
-  /* Strip trailing :1 dimensions */
+  /* Strip trailing :1 dimensions (outermost batch dims) */
   while (n > 1 && g_strcmp0(parts[n - 1], "1") == 0) n--;
   /* NNStreamer: innermost first → reverse to row-major */
-  for (size_t i = 0; i < n; i++)
-    shape[i] = (size_t)g_ascii_strtoull(parts[n - 1 - i], NULL, 10);
+  size_t raw[8];
+  for (size_t i = 0; i < n && i < 8; i++)
+    raw[i] = (size_t)g_ascii_strtoull(parts[n - 1 - i], NULL, 10);
   g_strfreev(parts);
-  return n;
+  /* Squeeze interior unit (=1) dimensions, keeping at least 2 dims */
+  size_t out = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (raw[i] != 1 || out == 0)
+      shape[out++] = raw[i];
+  }
+  /* Ensure at least 2 dimensions */
+  if (out < 2 && n >= 2) {
+    shape[out++] = 1;
+  }
+  return out;
 }
 
 
