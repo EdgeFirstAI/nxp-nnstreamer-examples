@@ -139,6 +139,7 @@ enum ArgFlag {
   ARG_SPEED        = (1u << 8),
   ARG_SEG          = (1u << 9),
   ARG_COMPUTE      = (1u << 10),
+  ARG_DETECTIONS   = (1u << 11),
 };
 
 /** @brief Parsed CLI arguments */
@@ -151,6 +152,7 @@ struct ParsedArgs {
   std::string compute;    // edgefirstcameraadaptor backend: "auto", "opengl", "g2d", "cpu"
   bool headless = false;
   bool instrumented = false;
+  bool detections = false;
   int numFrames = 0;
   double speed = 1.0;
   bool segmentation = false;
