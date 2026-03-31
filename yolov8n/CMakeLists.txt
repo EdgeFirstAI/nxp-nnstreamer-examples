@@ -14,6 +14,7 @@ pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0)
 pkg_check_modules(GST_ALLOC REQUIRED gstreamer-allocators-1.0)
 pkg_check_modules(CAIRO REQUIRED cairo)
 pkg_check_modules(NNSTREAMER REQUIRED nnstreamer)
+pkg_check_modules(EDGEFIRST_GST REQUIRED edgefirst-gstreamer-1.0)
 find_package(OpenMP REQUIRED)
 
 # Include directories
@@ -22,6 +23,7 @@ include_directories(
   ${GST_ALLOC_INCLUDE_DIRS}
   ${CAIRO_INCLUDE_DIRS}
   ${NNSTREAMER_INCLUDE_DIRS}
+  ${EDGEFIRST_GST_INCLUDE_DIRS}
   ${CMAKE_CURRENT_SOURCE_DIR}/common
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/cpp/include
 )
@@ -31,6 +33,7 @@ link_directories(
   ${GST_ALLOC_LIBRARY_DIRS}
   ${CAIRO_LIBRARY_DIRS}
   ${NNSTREAMER_LIBRARY_DIRS}
+  ${EDGEFIRST_GST_LIBRARY_DIRS}
 )
 
 # Shared common library
@@ -105,4 +108,19 @@ target_link_libraries(yolov8n_ara2_reference
   ${GSTREAMER_LIBRARIES}
   ${CAIRO_LIBRARIES}
   ${NNSTREAMER_LIBRARIES}
+)
+
+# --- yolov8n_seg ---
+# Instance segmentation with EdgeFirst overlay element for mask rendering.
+# Uses edgefirst-gstreamer overlay — no Cairo or OpenMP needed.
+add_executable(yolov8n_seg
+  yolov8n_seg.cpp
+  ${COMMON_SRC}
+)
+target_link_libraries(yolov8n_seg
+  ${GSTREAMER_LIBRARIES}
+  ${GST_ALLOC_LIBRARIES}
+  ${NNSTREAMER_LIBRARIES}
+  ${EDGEFIRST_GST_LIBRARIES}
+  edgefirst_hal
 )
