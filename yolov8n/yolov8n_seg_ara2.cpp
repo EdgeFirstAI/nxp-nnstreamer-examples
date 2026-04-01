@@ -836,7 +836,7 @@ int main(int argc, char **argv)
   } else {
     pipelineStr = g_strdup_printf(
         "%s ! %s "
-        "appsrc name=display format=3 is-live=true do-timestamp=true "
+        "appsrc name=display stream-type=0 format=3 is-live=true do-timestamp=true "
         "max-buffers=2 block=false ! "
         "waylandsink sync=false async=false",
         srcStr, nnBranch);
@@ -909,9 +909,6 @@ int main(int argc, char **argv)
           "height", G_TYPE_INT, app.srcHeight,
           "framerate", GST_TYPE_FRACTION, 0, 1,
           NULL);
-      /* Advertise DMA-BUF capability */
-      gst_caps_set_features(appCaps, 0,
-          gst_caps_features_new(GST_CAPS_FEATURE_MEMORY_DMABUF, NULL));
       g_object_set(app.appsrc, "caps", appCaps, NULL);
       gst_caps_unref(appCaps);
       app.dmabufAlloc = gst_dmabuf_allocator_new();
