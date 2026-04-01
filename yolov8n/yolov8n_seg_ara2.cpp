@@ -114,6 +114,8 @@ struct AppData {
   GstElement *appsrc;
   GstAllocator *dmabufAlloc;
   hal_tensor *canvas;         // DMA-backed RGBA at source resolution
+  int canvasFd;               // Cloned once at canvas creation, dup'd per push
+  size_t canvasSize;
   int srcWidth, srcHeight;
 
   // Tensor metadata from caps (filled on first frame)
@@ -518,10 +520,8 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
     return;
   }
 
-  /* Wrap output tensors as HAL tensors */
+  /* Wrap output tensors as HAL tensors (DMA-BUF zero-copy) */
   hal_tensor *hal_outputs[MAX_TENSORS] = {};
-  GstMapInfo out_maps[MAX_TENSORS] = {};
-  gboolean out_mapped[MAX_TENSORS] = {};
   hal_detect_box_list *boxes = NULL;
   hal_proto_data *proto = NULL;
   hal_segmentation_list *segs = NULL;
@@ -529,37 +529,21 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
   for (int j = 0; j < app->tensor_count; j++) {
     GstMemory *mem = gst_buffer_peek_memory(buffer, j);
 
-    /* Use HAL-convention shapes (batch prepended, features before boxes)
-     * to match the decoder config from auto_config_decoder. */
-    if (gst_is_dmabuf_memory(mem)) {
-      int fd = gst_dmabuf_memory_get_fd(mem);
-      hal_outputs[j] = hal_tensor_from_fd(
-          app->tensor_dtypes[j], dup(fd),
-          app->hal_shapes[j], app->hal_ndims[j], NULL);
-    } else {
-      if (!gst_memory_map(mem, &out_maps[j], GST_MAP_READ)) {
-        log_error("Cannot map output tensor %d\n", j);
-        goto cleanup;
-      }
-      out_mapped[j] = TRUE;
-
-      hal_outputs[j] = hal_tensor_new(
-          app->tensor_dtypes[j], app->hal_shapes[j],
-          app->hal_ndims[j], HAL_TENSOR_MEMORY_MEM, NULL);
-
-      if (hal_outputs[j]) {
-        hal_tensor_map *tmap = hal_tensor_map_create(hal_outputs[j]);
-        if (tmap) {
-          void *dst = hal_tensor_map_data(tmap);
-          if (dst)
-            memcpy(dst, out_maps[j].data, out_maps[j].size);
-          hal_tensor_map_unmap(tmap);
-        }
-      }
+    if (!gst_is_dmabuf_memory(mem)) {
+      log_error("Output tensor %d is not DMA-BUF — Ara-2 must output DMA-BUF\n", j);
+      goto cleanup;
     }
 
+    /* Zero-copy: wrap the NNStreamer DMA-BUF fd directly as a HAL tensor.
+     * dup() the fd so HAL owns its copy; GStreamer keeps the original. */
+    int fd = gst_dmabuf_memory_get_fd(mem);
+    hal_outputs[j] = hal_tensor_from_fd(
+        app->tensor_dtypes[j], dup(fd),
+        app->hal_shapes[j], app->hal_ndims[j], NULL);
+
     if (!hal_outputs[j]) {
-      log_error("Failed to create HAL tensor for output %d\n", j);
+      log_error("Failed to wrap DMA-BUF fd=%d for tensor %d (errno=%d: %s)\n",
+                fd, j, errno, strerror(errno));
       goto cleanup;
     }
   }
@@ -655,20 +639,23 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
     }
 
     /* Step 3: Draw masks onto canvas and push to appsrc for display */
-    if (app->appsrc && app->processor && segs) {
-      /* Lazy-create DMA-backed RGBA canvas at source resolution */
+    if (app->appsrc && app->processor) {
+      /* Lazy-create DMA-backed RGBA canvas + cache its fd */
       if (!app->canvas) {
         app->canvas = hal_image_processor_create_image(
             app->processor, app->srcWidth, app->srcHeight,
             HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
-        if (app->canvas)
-          log_info("Display canvas: %dx%d RGBA (DMA-BUF)\n",
-                   app->srcWidth, app->srcHeight);
-        else
+        if (app->canvas) {
+          app->canvasFd = hal_tensor_clone_fd(app->canvas);
+          app->canvasSize = hal_tensor_size(app->canvas);
+          log_info("Display canvas: %dx%d RGBA (DMA-BUF fd=%d, %zu bytes)\n",
+                   app->srcWidth, app->srcHeight, app->canvasFd, app->canvasSize);
+        } else {
           log_error("Failed to create display canvas\n");
+        }
       }
 
-      if (app->canvas) {
+      if (app->canvas && app->canvasFd >= 0) {
         /* Letterbox in normalized coords for draw_decoded_masks */
         float lb[4] = {0};
         if (app->letterbox.scale > 0) {
@@ -678,39 +665,40 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
           lb[3] = 1.0f - lb[1];
         }
 
+        /* draw_decoded_masks with NULL background clears the canvas
+         * and renders colored mask overlays from scratch each frame. */
         int draw_ret = hal_image_processor_draw_decoded_masks(
             app->processor, app->canvas,
             boxes, segs,
-            NULL,  /* no background for now */
+            NULL,  /* no background — masks on black */
             0.5f,  /* opacity */
             app->letterbox.scale > 0 ? lb : NULL,
             HAL_COLOR_MODE_INSTANCE);
 
         if (draw_ret == 0) {
-          /* Wrap canvas DMA-BUF fd as GstBuffer and push to appsrc */
-          int fd = hal_tensor_clone_fd(app->canvas);
-          if (fd >= 0) {
-            size_t buf_size = hal_tensor_size(app->canvas);
-            GstMemory *mem = gst_dmabuf_allocator_alloc(
-                app->dmabufAlloc, fd, buf_size);
-            GstBuffer *outBuf = gst_buffer_new();
-            gst_buffer_append_memory(outBuf, mem);
+          /* Push canvas DMA-BUF to appsrc. dup() the cached fd so
+           * GStreamer owns its copy; we keep canvasFd for reuse. */
+          int pushFd = dup(app->canvasFd);
+          GstMemory *mem = gst_dmabuf_allocator_alloc(
+              app->dmabufAlloc, pushFd, app->canvasSize);
+          GstBuffer *outBuf = gst_buffer_new();
+          gst_buffer_append_memory(outBuf, mem);
 
-            GstFlowReturn flow = gst_app_src_push_buffer(
-                GST_APP_SRC(app->appsrc), outBuf);
-            if (flow != GST_FLOW_OK) {
-              static bool first = true;
-              if (first) {
-                log_error("appsrc push failed: %s\n",
-                          gst_flow_get_name(flow));
-                first = false;
-              }
+          GstFlowReturn flow = gst_app_src_push_buffer(
+              GST_APP_SRC(app->appsrc), outBuf);
+          if (flow != GST_FLOW_OK) {
+            static bool first = true;
+            if (first) {
+              log_error("appsrc push failed: %s\n",
+                        gst_flow_get_name(flow));
+              first = false;
             }
           }
         } else {
           static bool first = true;
           if (first) {
-            log_error("draw_decoded_masks failed (ret=%d)\n", draw_ret);
+            log_error("draw_decoded_masks failed (ret=%d, errno=%d: %s)\n",
+                      draw_ret, errno, strerror(errno));
             first = false;
           }
         }
@@ -725,10 +713,6 @@ cleanup:
   for (int j = 0; j < app->tensor_count; j++) {
     if (hal_outputs[j]) hal_tensor_free(hal_outputs[j]);
   }
-  for (int j = 0; j < app->tensor_count; j++) {
-    if (out_mapped[j])
-      gst_memory_unmap(gst_buffer_peek_memory(buffer, j), &out_maps[j]);
-  }
 
   gettimeofday(&endTime, NULL);
   app->postproc.record(timeDiffMs(startTime, endTime));
@@ -740,10 +724,6 @@ cleanup_quit:
   if (boxes) hal_detect_box_list_free(boxes);
   for (int j = 0; j < app->tensor_count; j++) {
     if (hal_outputs[j]) hal_tensor_free(hal_outputs[j]);
-  }
-  for (int j = 0; j < app->tensor_count; j++) {
-    if (out_mapped[j])
-      gst_memory_unmap(gst_buffer_peek_memory(buffer, j), &out_maps[j]);
   }
   g_main_loop_quit(app->loop);
 }
@@ -847,6 +827,7 @@ int main(int argc, char **argv)
   log_info("Pipeline: %s\n\n", pipelineStr);
 
   AppData app = {};
+  app.canvasFd = -1;
   app.maxFrames = pargs.numFrames;
   app.headless = pargs.headless;
   app.preproc.reset();
@@ -950,6 +931,7 @@ int main(int argc, char **argv)
   gst_object_unref(app.bus);
   gst_object_unref(app.pipeline);
   g_main_loop_unref(app.loop);
+  if (app.canvasFd >= 0) close(app.canvasFd);
   if (app.canvas) hal_tensor_free(app.canvas);
   if (app.decoder) hal_decoder_free(app.decoder);
   if (app.processor) hal_image_processor_free(app.processor);
