@@ -535,14 +535,12 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
     }
 
     /* Zero-copy: wrap the NNStreamer DMA-BUF fd directly as a HAL tensor.
-     * Use NNStreamer-native squeezed shapes (tensor_shapes) — the DMA-BUF
-     * data layout matches NNStreamer ordering. The decoder config uses
-     * hal_shapes with dim names to handle the mapping internally.
+     * Use HAL-convention shapes (with batch dim) matching the decoder config.
      * dup() the fd so HAL owns its copy; GStreamer keeps the original. */
     int fd = gst_dmabuf_memory_get_fd(mem);
     hal_outputs[j] = hal_tensor_from_fd(
         app->tensor_dtypes[j], dup(fd),
-        app->tensor_shapes[j], app->tensor_ndims[j], NULL);
+        app->hal_shapes[j], app->hal_ndims[j], NULL);
 
     if (!hal_outputs[j]) {
       log_error("Failed to wrap DMA-BUF fd=%d for tensor %d (errno=%d: %s)\n",
