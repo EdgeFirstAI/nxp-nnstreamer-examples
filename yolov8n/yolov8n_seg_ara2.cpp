@@ -838,7 +838,7 @@ int main(int argc, char **argv)
         "%s ! %s "
         "appsrc name=display format=3 is-live=true do-timestamp=true "
         "max-buffers=2 block=false ! "
-        "waylandsink sync=false",
+        "waylandsink sync=false async=false",
         srcStr, nnBranch);
   }
   g_free(srcStr);
