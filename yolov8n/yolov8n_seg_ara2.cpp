@@ -112,8 +112,10 @@ struct AppData {
   // Tensor metadata from caps (filled on first frame)
   int tensor_count;
   hal_dtype tensor_dtypes[MAX_TENSORS];
-  size_t tensor_shapes[MAX_TENSORS][8];
+  size_t tensor_shapes[MAX_TENSORS][8];   // NNStreamer squeezed shapes
   size_t tensor_ndims[MAX_TENSORS];
+  size_t hal_shapes[MAX_TENSORS][8];      // HAL-convention shapes (batch prepended)
+  size_t hal_ndims[MAX_TENSORS];
   bool decoder_configured;
 };
 
@@ -252,6 +254,27 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps, GstBuffer *buffer)
   if (boxes_idx < 0 || scores_idx < 0) {
     log_error("Cannot identify boxes and scores tensors\n");
     return false;
+  }
+
+  /* Compute HAL-convention shapes with batch=1 prepended.
+   * 2D [num_boxes, features] → [1, features, num_boxes]
+   * 3D protos [H, W, C] → [1, C, H, W] */
+  for (int i = 0; i < app->tensor_count; i++) {
+    size_t *ns = app->tensor_shapes[i];
+    if (i == protos_idx) {
+      /* [H, W, C] → [1, C, H, W] */
+      app->hal_shapes[i][0] = 1;
+      app->hal_shapes[i][1] = ns[2]; /* C */
+      app->hal_shapes[i][2] = ns[0]; /* H */
+      app->hal_shapes[i][3] = ns[1]; /* W */
+      app->hal_ndims[i] = 4;
+    } else {
+      /* [num_boxes, features] → [1, features, num_boxes] */
+      app->hal_shapes[i][0] = 1;
+      app->hal_shapes[i][1] = ns[1]; /* features */
+      app->hal_shapes[i][2] = ns[0]; /* num_boxes */
+      app->hal_ndims[i] = 3;
+    }
   }
 
   /* Extract quant params from GstNnsTensorQuantMeta (attached by tensor_filter).
@@ -499,11 +522,13 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
   for (int j = 0; j < app->tensor_count; j++) {
     GstMemory *mem = gst_buffer_peek_memory(buffer, j);
 
+    /* Use HAL-convention shapes (batch prepended, features before boxes)
+     * to match the decoder config from auto_config_decoder. */
     if (gst_is_dmabuf_memory(mem)) {
       int fd = gst_dmabuf_memory_get_fd(mem);
       hal_outputs[j] = hal_tensor_from_fd(
           app->tensor_dtypes[j], dup(fd),
-          app->tensor_shapes[j], app->tensor_ndims[j], NULL);
+          app->hal_shapes[j], app->hal_ndims[j], NULL);
     } else {
       if (!gst_memory_map(mem, &out_maps[j], GST_MAP_READ)) {
         log_error("Cannot map output tensor %d\n", j);
@@ -512,8 +537,8 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
       out_mapped[j] = TRUE;
 
       hal_outputs[j] = hal_tensor_new(
-          app->tensor_dtypes[j], app->tensor_shapes[j],
-          app->tensor_ndims[j], HAL_TENSOR_MEMORY_MEM, NULL);
+          app->tensor_dtypes[j], app->hal_shapes[j],
+          app->hal_ndims[j], HAL_TENSOR_MEMORY_MEM, NULL);
 
       if (hal_outputs[j]) {
         hal_tensor_map *tmap = hal_tensor_map_create(hal_outputs[j]);
