@@ -218,95 +218,105 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps)
              i, app->tensor_ndims[i], shape_str, app->tensor_dtypes[i]);
   }
 
-  /* Pass 2: build decoder params */
-  hal_decoder_params *params = hal_decoder_params_new();
-  hal_decoder_params_set_score_threshold(params, CONF_THRESHOLD);
-  hal_decoder_params_set_iou_threshold(params, NMS_IOU_THRESHOLD);
-  hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
-  hal_decoder_params_set_decoder_version(params, HAL_DECODER_VERSION_YOLOV8);
+  /* Pass 2: identify tensor roles and build JSON config.
+   * JSON config is used instead of the programmatic API because it lets
+   * us specify dtype per output, which the Ara-2 mixed-type tensors need. */
+  int protos_idx = -1, scores_idx = -1, boxes_idx = -1, coeffs_idx = -1;
 
   for (int i = 0; i < app->tensor_count; i++) {
     size_t ndim = app->tensor_ndims[i];
-    hal_dtype dtype = app->tensor_dtypes[i];
-
-    /* Work with a local copy so we can rearrange for the HAL API.
-     * After squeeze, 2D shapes are [num_boxes, features].
-     * HAL expects [batch, features, num_boxes] for split outputs. */
-    size_t out_shape[8] = {};
-    memcpy(out_shape, app->tensor_shapes[i], ndim * sizeof(size_t));
-
-    HalOutputType type;
-    HalDimName dims[8];
+    size_t feat_dim = (ndim >= 2) ? app->tensor_shapes[i][1] : 0;
 
     if (ndim == 3) {
-      /* Protos: [H, W, C] — already correct */
-      type = HAL_OUTPUT_TYPE_PROTOS;
-      dims[0] = HAL_DIM_NAME_HEIGHT;
-      dims[1] = HAL_DIM_NAME_WIDTH;
-      dims[2] = HAL_DIM_NAME_NUM_PROTOS;
-    } else if (has_split_boxes && ndim == 2) {
-      /* 2D tensor [num_boxes, features] → rearrange to [1, features, num_boxes] */
-      size_t num_boxes = out_shape[0];
-      size_t feat_dim = out_shape[1];
-      out_shape[0] = 1;
-      out_shape[1] = feat_dim;
-      out_shape[2] = num_boxes;
-      ndim = 3;
-
-      if (feat_dim == 4) {
-        type = HAL_OUTPUT_TYPE_BOXES;
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_BOX_COORDS;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-      } else if (has_protos && proto_channels > 0 && feat_dim == proto_channels) {
-        type = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_NUM_PROTOS;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-      } else {
-        type = HAL_OUTPUT_TYPE_SCORES;
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_NUM_CLASSES;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-      }
+      protos_idx = i;
+    } else if (has_split_boxes && feat_dim == 4) {
+      boxes_idx = i;
+    } else if (has_protos && proto_channels > 0 && feat_dim == proto_channels) {
+      coeffs_idx = i;
     } else {
-      type = HAL_OUTPUT_TYPE_DETECTION;
-      if (ndim >= 3) {
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_NUM_BOXES;
-        dims[2] = HAL_DIM_NAME_NUM_FEATURES;
-        ndim = 3;
-      } else {
-        dims[0] = HAL_DIM_NAME_NUM_BOXES;
-        dims[1] = HAL_DIM_NAME_NUM_FEATURES;
-      }
+      scores_idx = i;
     }
-
-    int idx = hal_decoder_params_add_output(params, type,
-        HAL_DECODER_TYPE_ULTRALYTICS, out_shape, dims, ndim);
-
-    /* Set quantization placeholder for non-float tensors.
-     * Real quant params are extracted from GstNnsTensorQuantMeta below. */
-    if (dtype != HAL_DTYPE_F32 && idx >= 0) {
-      hal_decoder_params_output_set_quantization(params, idx, 1.0f, 0);
-    }
-
-    const char *type_names[] = {
-      "DETECTION", "BOXES", "SCORES", "PROTOS",
-      "SEGMENTATION", "MASK_COEFFICIENTS", "MASK", "CLASSES"
-    };
-    log_info("  [%d] → %s (idx=%d)\n", i,
-             type < 8 ? type_names[type] : "?", idx);
   }
+
+  log_info("  Tensor roles: protos=%d, scores=%d, boxes=%d, coeffs=%d\n",
+           protos_idx, scores_idx, boxes_idx, coeffs_idx);
 
   g_strfreev(dim_parts);
   g_strfreev(type_parts);
 
-  /* Update quantization from GstNnsTensorQuantMeta if available.
-   * This happens on the first buffer, not during caps — we'll do it later. */
+  /* Helper to get dtype string */
+  auto dtype_str = [](hal_dtype d) -> const char* {
+    switch(d) {
+      case HAL_DTYPE_U8:  return "uint8";
+      case HAL_DTYPE_I8:  return "int8";
+      case HAL_DTYPE_I16: return "int16";
+      case HAL_DTYPE_I32: return "int32";
+      default:            return "float32";
+    }
+  };
+  auto is_signed = [](hal_dtype d) -> bool {
+    return d == HAL_DTYPE_I8 || d == HAL_DTYPE_I16 || d == HAL_DTYPE_I32;
+  };
 
+  /* Build JSON config string */
+  GString *json = g_string_new("{\"outputs\":[");
+
+  if (scores_idx >= 0) {
+    size_t n = app->tensor_shapes[scores_idx][0]; /* num_boxes */
+    size_t c = app->tensor_shapes[scores_idx][1]; /* num_classes */
+    hal_dtype dt = app->tensor_dtypes[scores_idx];
+    g_string_append_printf(json,
+        "{\"decoder\":\"ultralytics\",\"type\":\"scores\","
+        "\"shape\":[1,%zu,%zu],\"quantization\":[1.0,0],"
+        "\"dtype\":\"%s\"%s},",
+        c, n, dtype_str(dt), is_signed(dt) ? ",\"signed\":true" : "");
+  }
+  if (boxes_idx >= 0) {
+    size_t n = app->tensor_shapes[boxes_idx][0];
+    hal_dtype dt = app->tensor_dtypes[boxes_idx];
+    g_string_append_printf(json,
+        "{\"decoder\":\"ultralytics\",\"type\":\"boxes\","
+        "\"shape\":[1,4,%zu],\"quantization\":[1.0,0],"
+        "\"dtype\":\"%s\"%s},",
+        n, dtype_str(dt), is_signed(dt) ? ",\"signed\":true" : "");
+  }
+  if (coeffs_idx >= 0) {
+    size_t n = app->tensor_shapes[coeffs_idx][0];
+    size_t p = app->tensor_shapes[coeffs_idx][1]; /* num_protos */
+    hal_dtype dt = app->tensor_dtypes[coeffs_idx];
+    g_string_append_printf(json,
+        "{\"decoder\":\"ultralytics\",\"type\":\"mask_coefficients\","
+        "\"shape\":[1,%zu,%zu],\"quantization\":[1.0,0],"
+        "\"dtype\":\"%s\"%s},",
+        p, n, dtype_str(dt), is_signed(dt) ? ",\"signed\":true" : "");
+  }
+  if (protos_idx >= 0) {
+    size_t h = app->tensor_shapes[protos_idx][0];
+    size_t w = app->tensor_shapes[protos_idx][1];
+    size_t p = app->tensor_shapes[protos_idx][2];
+    hal_dtype dt = app->tensor_dtypes[protos_idx];
+    g_string_append_printf(json,
+        "{\"decoder\":\"ultralytics\",\"type\":\"protos\","
+        "\"shape\":[%zu,%zu,%zu],\"quantization\":[1.0,0],"
+        "\"dtype\":\"%s\"%s},",
+        h, w, p, dtype_str(dt), is_signed(dt) ? ",\"signed\":true" : "");
+  }
+
+  /* Remove trailing comma and close */
+  if (json->str[json->len - 1] == ',')
+    g_string_truncate(json, json->len - 1);
+  g_string_append(json, "],\"nms\":\"class_agnostic\"}");
+
+  log_info("HAL config JSON: %s\n", json->str);
+
+  hal_decoder_params *params = hal_decoder_params_new();
+  hal_decoder_params_set_config_json(params, json->str, 0);
+  hal_decoder_params_set_score_threshold(params, CONF_THRESHOLD);
+  hal_decoder_params_set_iou_threshold(params, NMS_IOU_THRESHOLD);
+  hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
   app->decoder = hal_decoder_new(params);
   hal_decoder_params_free(params);
+  g_string_free(json, TRUE);
 
   if (!app->decoder) {
     log_error("HAL decoder creation failed (errno=%d: %s)\n", errno, strerror(errno));
