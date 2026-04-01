@@ -30,6 +30,7 @@
 
 #include <gst/gst.h>
 #include <gst/allocators/gstdmabuf.h>
+#include <gst/app/gstappsrc.h>
 #include <glib.h>
 #include <glib-unix.h>
 
@@ -108,6 +109,12 @@ struct AppData {
   // HAL decoder + image processor
   hal_decoder *decoder;
   hal_image_processor *processor;
+
+  // Display via appsrc: HAL renders masks onto canvas, pushed as DMA-BUF
+  GstElement *appsrc;
+  GstAllocator *dmabufAlloc;
+  hal_tensor *canvas;         // DMA-backed RGBA at source resolution
+  int srcWidth, srcHeight;
 
   // Tensor metadata from caps (filled on first frame)
   int tensor_count;
@@ -646,6 +653,69 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
       app->postproc.record(timeDiffMs(startTime, endTime));
       goto cleanup_quit;
     }
+
+    /* Step 3: Draw masks onto canvas and push to appsrc for display */
+    if (app->appsrc && app->processor && segs) {
+      /* Lazy-create DMA-backed RGBA canvas at source resolution */
+      if (!app->canvas) {
+        app->canvas = hal_image_processor_create_image(
+            app->processor, app->srcWidth, app->srcHeight,
+            HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+        if (app->canvas)
+          log_info("Display canvas: %dx%d RGBA (DMA-BUF)\n",
+                   app->srcWidth, app->srcHeight);
+        else
+          log_error("Failed to create display canvas\n");
+      }
+
+      if (app->canvas) {
+        /* Letterbox in normalized coords for draw_decoded_masks */
+        float lb[4] = {0};
+        if (app->letterbox.scale > 0) {
+          lb[0] = (float)app->letterbox.padX / MODEL_INPUT_SIZE;
+          lb[1] = (float)app->letterbox.padY / MODEL_INPUT_SIZE;
+          lb[2] = 1.0f - lb[0];
+          lb[3] = 1.0f - lb[1];
+        }
+
+        int draw_ret = hal_image_processor_draw_decoded_masks(
+            app->processor, app->canvas,
+            boxes, segs,
+            NULL,  /* no background for now */
+            0.5f,  /* opacity */
+            app->letterbox.scale > 0 ? lb : NULL,
+            HAL_COLOR_MODE_INSTANCE);
+
+        if (draw_ret == 0) {
+          /* Wrap canvas DMA-BUF fd as GstBuffer and push to appsrc */
+          int fd = hal_tensor_clone_fd(app->canvas);
+          if (fd >= 0) {
+            size_t buf_size = hal_tensor_size(app->canvas);
+            GstMemory *mem = gst_dmabuf_allocator_alloc(
+                app->dmabufAlloc, fd, buf_size);
+            GstBuffer *outBuf = gst_buffer_new();
+            gst_buffer_append_memory(outBuf, mem);
+
+            GstFlowReturn flow = gst_app_src_push_buffer(
+                GST_APP_SRC(app->appsrc), outBuf);
+            if (flow != GST_FLOW_OK) {
+              static bool first = true;
+              if (first) {
+                log_error("appsrc push failed: %s\n",
+                          gst_flow_get_name(flow));
+                first = false;
+              }
+            }
+          }
+        } else {
+          static bool first = true;
+          if (first) {
+            log_error("draw_decoded_masks failed (ret=%d)\n", draw_ret);
+            first = false;
+          }
+        }
+      }
+    }
   }
 
 cleanup:
@@ -756,19 +826,20 @@ int main(int argc, char **argv)
       MODEL_INPUT_SIZE, MODEL_INPUT_SIZE,
       pargs.model.c_str());
 
-  /* Build full pipeline */
+  /* Build full pipeline.
+   * Display mode: appsrc pushes HAL-rendered RGBA frames to waylandsink.
+   * The appsrc is a separate bin linked via gst_parse_launch; we push
+   * DMA-BUF-backed buffers from the tensor_sink callback after draw_decoded_masks. */
   char *pipelineStr;
   if (pargs.headless) {
     pipelineStr = g_strdup_printf("%s ! %s", srcStr, nnBranch);
   } else {
-    const char *syncMode = (srcType == INPUT_IMAGE || srcType == INPUT_VIDEO) ? "true" : "false";
     pipelineStr = g_strdup_printf(
-        "%s ! tee name=t "
-        "t. ! %s "
-        "t. ! queue name=thread-img max-size-buffers=2 ! "
-        "imxvideoconvert_g2d ! "
-        "waylandsink sync=%s",
-        srcStr, nnBranch, syncMode);
+        "%s ! %s "
+        "appsrc name=display format=3 is-live=true do-timestamp=true "
+        "max-buffers=2 block=false ! "
+        "waylandsink sync=false",
+        srcStr, nnBranch);
   }
   g_free(srcStr);
   g_free(nnBranch);
@@ -786,7 +857,10 @@ int main(int argc, char **argv)
   /* Create image processor early (before pipeline) with OpenGL backend
    * for GPU-accelerated mask materialization and overlay rendering. */
   log_info("Creating HAL image processor (OpenGL backend)...\n");
+  fflush(stdout);
   app.processor = hal_image_processor_new_with_backend(HAL_COMPUTE_BACKEND_OPENGL);
+  log_info("hal_image_processor_new_with_backend returned %p\n", (void *)app.processor);
+  fflush(stdout);
   if (!app.processor) {
     log_error("HAL image processor creation failed (errno=%d: %s)\n", errno, strerror(errno));
     log_info("Continuing without mask materialization — decode_proto only\n");
@@ -823,6 +897,29 @@ int main(int argc, char **argv)
   app.tensorSink = gst_bin_get_by_name(GST_BIN(app.pipeline), "inferenceOutput");
   g_signal_connect(app.tensorSink, "new-data", G_CALLBACK(newDataCallback), &app);
 
+  /* appsrc for display (non-headless only) */
+  if (!pargs.headless) {
+    app.appsrc = gst_bin_get_by_name(GST_BIN(app.pipeline), "display");
+    if (app.appsrc) {
+      app.srcWidth = SOURCE_WIDTH;
+      app.srcHeight = SOURCE_HEIGHT;
+      GstCaps *appCaps = gst_caps_new_simple("video/x-raw",
+          "format", G_TYPE_STRING, "RGBA",
+          "width", G_TYPE_INT, app.srcWidth,
+          "height", G_TYPE_INT, app.srcHeight,
+          "framerate", GST_TYPE_FRACTION, 0, 1,
+          NULL);
+      /* Advertise DMA-BUF capability */
+      gst_caps_set_features(appCaps, 0,
+          gst_caps_features_new(GST_CAPS_FEATURE_MEMORY_DMABUF, NULL));
+      g_object_set(app.appsrc, "caps", appCaps, NULL);
+      gst_caps_unref(appCaps);
+      app.dmabufAlloc = gst_dmabuf_allocator_new();
+      log_info("Display: appsrc configured for %dx%d RGBA DMA-BUF\n",
+               app.srcWidth, app.srcHeight);
+    }
+  }
+
   /* tensor_filter for latency query */
   app.tensorFilter = gst_bin_get_by_name(GST_BIN(app.pipeline), "tfilter");
 
@@ -856,8 +953,11 @@ int main(int argc, char **argv)
   gst_object_unref(app.bus);
   gst_object_unref(app.pipeline);
   g_main_loop_unref(app.loop);
+  if (app.canvas) hal_tensor_free(app.canvas);
   if (app.decoder) hal_decoder_free(app.decoder);
   if (app.processor) hal_image_processor_free(app.processor);
+  if (app.appsrc) gst_object_unref(app.appsrc);
+  if (app.dmabufAlloc) gst_object_unref(app.dmabufAlloc);
 
   return 0;
 }
