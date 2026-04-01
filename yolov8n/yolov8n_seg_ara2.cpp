@@ -39,7 +39,9 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <string>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <vector>
@@ -110,10 +112,14 @@ struct AppData {
   hal_decoder *decoder;
   hal_image_processor *processor;
 
+  // Input tensor cache: keyed by DMA-BUF inode, reuse HAL tensor across frames.
+  // Ara-2 uses a fixed pool so the same inodes cycle — cache hit every frame.
+  std::map<ino_t, hal_tensor *> inputCache;
+
   // Display via appsrc: HAL renders masks onto canvas, pushed as DMA-BUF
   GstElement *appsrc;
   GstAllocator *dmabufAlloc;
-  hal_tensor *canvas;         // DMA-backed RGBA at source resolution
+  hal_tensor *canvas;         // Created once, reused forever
   int canvasFd;               // Cloned once at canvas creation, dup'd per push
   size_t canvasSize;
   int srcWidth, srcHeight;
@@ -520,7 +526,9 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
     return;
   }
 
-  /* Wrap output tensors as HAL tensors (DMA-BUF zero-copy) */
+  /* Wrap output tensors as HAL tensors (DMA-BUF zero-copy with inode cache).
+   * Ara-2 uses a fixed DMA-BUF pool — the same inodes cycle each frame.
+   * Caching the HAL tensor avoids re-importing the EGLImage every frame. */
   hal_tensor *hal_outputs[MAX_TENSORS] = {};
   hal_detect_box_list *boxes = NULL;
   hal_proto_data *proto = NULL;
@@ -534,18 +542,33 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
       goto cleanup;
     }
 
-    /* Zero-copy: wrap the NNStreamer DMA-BUF fd directly as a HAL tensor.
-     * Use HAL-convention shapes (with batch dim) matching the decoder config.
-     * dup() the fd so HAL owns its copy; GStreamer keeps the original. */
     int fd = gst_dmabuf_memory_get_fd(mem);
-    hal_outputs[j] = hal_tensor_from_fd(
-        app->tensor_dtypes[j], dup(fd),
-        app->hal_shapes[j], app->hal_ndims[j], NULL);
-
-    if (!hal_outputs[j]) {
-      log_error("Failed to wrap DMA-BUF fd=%d for tensor %d (errno=%d: %s)\n",
-                fd, j, errno, strerror(errno));
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+      log_error("fstat failed for tensor %d fd=%d: %s\n", j, fd, strerror(errno));
       goto cleanup;
+    }
+
+    auto it = app->inputCache.find(st.st_ino);
+    if (it != app->inputCache.end()) {
+      /* Cache hit — reuse existing HAL tensor. The DMA-BUF memory is the
+       * same physical buffer, so new frame data is already visible. */
+      hal_outputs[j] = it->second;
+    } else {
+      /* Cache miss — import once, cache for future frames.
+       * dup() the fd so HAL owns its copy. */
+      hal_tensor *t = hal_tensor_from_fd(
+          app->tensor_dtypes[j], dup(fd),
+          app->hal_shapes[j], app->hal_ndims[j], NULL);
+      if (!t) {
+        log_error("hal_tensor_from_fd failed for tensor %d fd=%d inode=%lu (errno=%d: %s)\n",
+                  j, fd, (unsigned long)st.st_ino, errno, strerror(errno));
+        goto cleanup;
+      }
+      app->inputCache[st.st_ino] = t;
+      hal_outputs[j] = t;
+      log_info("Input cache miss: tensor[%d] fd=%d inode=%lu → cached\n",
+               j, fd, (unsigned long)st.st_ino);
     }
   }
 
@@ -711,9 +734,7 @@ cleanup:
   if (segs) hal_segmentation_list_free(segs);
   if (proto) hal_proto_data_free(proto);
   if (boxes) hal_detect_box_list_free(boxes);
-  for (int j = 0; j < app->tensor_count; j++) {
-    if (hal_outputs[j]) hal_tensor_free(hal_outputs[j]);
-  }
+  /* hal_outputs[] are cached — do NOT free per-frame */
 
   gettimeofday(&endTime, NULL);
   app->postproc.record(timeDiffMs(startTime, endTime));
@@ -723,9 +744,7 @@ cleanup_quit:
   if (segs) hal_segmentation_list_free(segs);
   if (proto) hal_proto_data_free(proto);
   if (boxes) hal_detect_box_list_free(boxes);
-  for (int j = 0; j < app->tensor_count; j++) {
-    if (hal_outputs[j]) hal_tensor_free(hal_outputs[j]);
-  }
+  /* hal_outputs[] are cached — do NOT free per-frame */
   g_main_loop_quit(app->loop);
 }
 
@@ -932,6 +951,9 @@ int main(int argc, char **argv)
   gst_object_unref(app.bus);
   gst_object_unref(app.pipeline);
   g_main_loop_unref(app.loop);
+  for (auto &kv : app.inputCache)
+    hal_tensor_free(kv.second);
+  app.inputCache.clear();
   if (app.canvasFd >= 0) close(app.canvasFd);
   if (app.canvas) hal_tensor_free(app.canvas);
   if (app.decoder) hal_decoder_free(app.decoder);
