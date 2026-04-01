@@ -6,7 +6,7 @@
 # YOLOv8n Instance Segmentation Demo — EdgeFirst Overlay Pipeline
 #
 # Demonstrates the edgefirstoverlay element with a TFLite segmentation model
-# on the i.MX 8M Plus using VX-Delegate + CameraAdaptor + DMA-BUF zero-copy.
+# on the i.MX 8M Plus using edgefirstcameraadaptor + VX-Delegate + DMA-BUF.
 #
 # Usage:
 #   yolov8n_seg.sh [model_path]
@@ -32,7 +32,7 @@ gst-launch-1.0 -e \
      ! edgefirstoverlay name=ov score-threshold=0.25 iou-threshold=0.45 \
      ! waylandsink \
   t. ! queue leaky=2 max-size-buffers=2 \
-     ! edgefirstcameraadaptor model-width=640 model-height=640 model-dtype=uint8 letterbox=true \
+     ! edgefirstcameraadaptor model-width=640 model-height=640 model-dtype=uint8 model-colorspace=rgba letterbox=true \
      ! tensor_filter framework=tensorflow2-lite model="$MODEL" \
          custom=Delegate:External,ExtDelegateLib:libvx_delegate.so,CameraAdaptor:rgba,DmaBuf:true \
          latency=1 \

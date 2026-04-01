@@ -240,127 +240,62 @@ int main(int argc, char **argv)
     printf("  Compute: %s\n", pargs.compute.c_str());
   printf("\n");
 
-  /* ---- Build pipeline programmatically ---- */
+  /* ---- Build pipeline via gst_parse_launch ---- */
 
-  GstElement *pipeline = gst_pipeline_new("yolov8n-seg");
-  GMainLoop  *loop     = g_main_loop_new(NULL, FALSE);
+  GMainLoop *loop = g_main_loop_new(NULL, FALSE);
 
-  /* Source bin */
+  /* Build source element string */
   InputSource inputSrc = determineInputSource(pargs, false);
   char *srcStr = buildSourceElement(inputSrc, pargs);
-  GError *err = NULL;
-  GstElement *srcBin = gst_parse_bin_from_description(srcStr, TRUE, &err);
+
+  /* Build compute property strings */
+  std::string computeCA, computeOV;
+  if (!pargs.compute.empty()) {
+    computeCA = std::string(" compute=") + pargs.compute;
+    computeOV = std::string(" compute=") + pargs.compute;
+  }
+
+  /* Sink element */
+  const char *sinkStr = pargs.headless
+      ? "fakesink name=sink sync=false"
+      : "waylandsink name=sink";
+
+  /* Full pipeline string — gst_parse_launch handles dynamic pads (qtdemux) */
+  gchar *pipeStr = g_strdup_printf(
+      "%s ! tee name=t "
+      "t. ! queue name=q-disp leaky=2 max-size-buffers=2 "
+      "   ! edgefirstoverlay name=ov score-threshold=0.25 iou-threshold=0.45 "
+      "     decoder-version=yolov8%s "
+      "   ! %s "
+      "t. ! queue name=q-nn leaky=2 max-size-buffers=2 "
+      "   ! edgefirstcameraadaptor name=ca model-width=640 model-height=640 "
+      "     model-dtype=uint8 model-colorspace=rgba letterbox=true%s "
+      "   ! tensor_filter name=tfilter framework=tensorflow2-lite "
+      "     model=%s "
+      "     custom=Delegate:External,ExtDelegateLib:libvx_delegate.so,CameraAdaptor:rgba,DmaBuf:true "
+      "     latency=1 "
+      "   ! ov.tensors",
+      srcStr, computeOV.c_str(), sinkStr, computeCA.c_str(),
+      pargs.model.c_str());
   g_free(srcStr);
-  if (!srcBin) {
-    g_printerr("Failed to create source bin: %s\n", err ? err->message : "unknown");
+
+  GError *err = NULL;
+  GstElement *pipeline = gst_parse_launch(pipeStr, &err);
+  g_free(pipeStr);
+  if (!pipeline) {
+    g_printerr("Failed to create pipeline: %s\n", err ? err->message : "unknown");
     if (err) g_error_free(err);
     return 1;
   }
-  gst_bin_add(GST_BIN(pipeline), srcBin);
 
-  /* Tee */
-  GstElement *tee = gst_element_factory_make("tee", "t");
-
-  /* Display branch: queue -> overlay -> sink */
-  GstElement *qDisp  = gst_element_factory_make("queue", "q-disp");
-  GstElement *overlay = gst_element_factory_make("edgefirstoverlay", "ov");
-  GstElement *sink;
-  if (pargs.headless) {
-    sink = gst_element_factory_make("fakesink", "sink");
-    g_object_set(sink, "sync", FALSE, NULL);
-  } else {
-    sink = gst_element_factory_make("waylandsink", "sink");
-    /* sync=true for camera, sync=true for video (decode rate) */
-  }
-
-  /* NN branch: queue -> cameraadaptor -> tensor_filter */
-  GstElement *qNN     = gst_element_factory_make("queue", "q-nn");
-  GstElement *ca      = gst_element_factory_make("edgefirstcameraadaptor", "ca");
-  GstElement *tfilter = gst_element_factory_make("tensor_filter", "tfilter");
-
-  if (!tee || !qDisp || !overlay || !sink || !qNN || !ca || !tfilter) {
-    g_printerr("Failed to create one or more pipeline elements.\n");
-    g_printerr("  tee=%p q-disp=%p overlay=%p sink=%p q-nn=%p ca=%p tfilter=%p\n",
-               (void*)tee, (void*)qDisp, (void*)overlay, (void*)sink,
-               (void*)qNN, (void*)ca, (void*)tfilter);
+  /* Look up named elements for probes and signals */
+  GstElement *overlay = gst_bin_get_by_name(GST_BIN(pipeline), "ov");
+  GstElement *ca      = gst_bin_get_by_name(GST_BIN(pipeline), "ca");
+  GstElement *tfilter = gst_bin_get_by_name(GST_BIN(pipeline), "tfilter");
+  if (!overlay || !ca || !tfilter) {
+    g_printerr("Failed to find named elements in pipeline\n");
     return 1;
   }
-
-  /* Configure queue elements */
-  g_object_set(qDisp, "leaky", 2, "max-size-buffers", 2, NULL);
-  g_object_set(qNN,   "leaky", 2, "max-size-buffers", 2, NULL);
-
-  /* Configure edgefirstoverlay */
-  g_object_set(overlay,
-      "score-threshold", 0.25f,
-      "iou-threshold",   0.45f,
-      "decoder-version", "yolov8",
-      NULL);
-
-  /* Configure edgefirstcameraadaptor */
-  g_object_set(ca,
-      "model-width",  640,
-      "model-height", 640,
-      "letterbox",    TRUE,
-      NULL);
-  gst_util_set_object_arg(G_OBJECT(ca), "model-dtype", "uint8");
-  if (!pargs.compute.empty())
-    gst_util_set_object_arg(G_OBJECT(ca), "compute", pargs.compute.c_str());
-
-  /* Configure tensor_filter */
-  g_object_set(tfilter,
-      "framework", "tensorflow2-lite",
-      "model",     pargs.model.c_str(),
-      "custom",    "Delegate:External,ExtDelegateLib:libvx_delegate.so,"
-                   "CameraAdaptor:rgba,DmaBuf:true",
-      "latency",   1,
-      NULL);
-
-  /* Add all elements to pipeline */
-  gst_bin_add_many(GST_BIN(pipeline),
-      tee, qDisp, overlay, sink, qNN, ca, tfilter, NULL);
-
-  /* Link: source -> tee */
-  if (!gst_element_link(srcBin, tee)) {
-    g_printerr("Failed to link source -> tee\n");
-    return 1;
-  }
-
-  /* Link display branch: tee -> q-disp -> overlay(video) -> sink */
-  if (!gst_element_link(tee, qDisp)) {
-    g_printerr("Failed to link tee -> q-disp\n");
-    return 1;
-  }
-  /* Link q-disp to overlay's video sink pad */
-  GstPad *qDispSrc = gst_element_get_static_pad(qDisp, "src");
-  GstPad *ovVideo  = gst_element_get_static_pad(overlay, "video");
-  if (gst_pad_link(qDispSrc, ovVideo) != GST_PAD_LINK_OK) {
-    g_printerr("Failed to link q-disp -> overlay.video\n");
-    return 1;
-  }
-  gst_object_unref(qDispSrc);
-  gst_object_unref(ovVideo);
-
-  if (!gst_element_link(overlay, sink)) {
-    g_printerr("Failed to link overlay -> sink\n");
-    return 1;
-  }
-
-  /* Link NN branch: tee -> q-nn -> cameraadaptor -> tensor_filter */
-  if (!gst_element_link_many(tee, qNN, ca, tfilter, NULL)) {
-    g_printerr("Failed to link NN branch (tee -> q-nn -> ca -> tfilter)\n");
-    return 1;
-  }
-
-  /* Link tensor_filter -> overlay's tensors sink pad */
-  GstPad *tfilterSrc = gst_element_get_static_pad(tfilter, "src");
-  GstPad *ovTensors  = gst_element_get_static_pad(overlay, "tensors");
-  if (gst_pad_link(tfilterSrc, ovTensors) != GST_PAD_LINK_OK) {
-    g_printerr("Failed to link tfilter -> overlay.tensors\n");
-    return 1;
-  }
-  gst_object_unref(tfilterSrc);
-  gst_object_unref(ovTensors);
 
   /* ---- Initialize app data ---- */
 
@@ -439,6 +374,9 @@ int main(int argc, char **argv)
   if (app.instrumented)
     printTimingReport(&app);
 
+  gst_object_unref(overlay);
+  gst_object_unref(ca);
+  gst_object_unref(tfilter);
   gst_object_unref(app.bus);
   gst_object_unref(pipeline);
   g_main_loop_unref(loop);
