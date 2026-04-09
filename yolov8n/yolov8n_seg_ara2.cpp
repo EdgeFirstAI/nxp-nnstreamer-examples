@@ -7,17 +7,37 @@
  * Demonstrates the appsink/appsrc bridge pattern for GPU-accelerated
  * segmentation mask overlay rendering in a GStreamer pipeline.
  *
- * Architecture:
- *   source → tee
- *     tee → queue → appsink (capture camera DMA-BUF frames)
+ * Display mode architecture:
+ *
+ *   source → identity sync=true → tee
+ *     tee → queue → appsink (latest DMA-BUF frame, sync=false drop=true)
  *     tee → queue → edgefirstcameraadaptor → tensor_filter(ara2) → tensor_sink
  *   appsrc → waylandsink (HAL-rendered RGBA canvas)
  *
- * In the tensor_sink callback:
- *   1. Pull latest camera frame from appsink (inode-cached hal_import_image)
- *   2. Fused hal_image_processor_draw_masks: decode + render in one call
- *      with camera frame as background → colored mask overlay on live video
- *   3. Push canvas DMA-BUF to appsrc → waylandsink
+ *   The `identity sync=true` element paces file-based sources to their natural
+ *   PTS rate (25 FPS for a 25 FPS video), otherwise the decoder races at full
+ *   speed. Camera sources are already live-clocked and pass through unchanged.
+ *
+ *   In the tensor_sink callback:
+ *     1. Pull latest camera frame from appsink (inode-cached hal_import_image)
+ *     2. Fused hal_image_processor_draw_masks: decode + render in one call
+ *        with camera frame as background → colored mask overlay on live video
+ *     3. Push canvas DMA-BUF to appsrc → waylandsink
+ *     4. Release the source sample only after draw_masks returns, to avoid
+ *        the v4l2 pool recycling pages under a live GPU read.
+ *
+ *   Video loop: an EOS pad probe on the appsink sink pad defers a FLUSH seek
+ *   to the main thread via g_idle_add (seeking from a streaming thread
+ *   deadlocks), then re-primes the appsrc with a canvas buffer to unblock
+ *   waylandsink preroll.
+ *
+ * Headless mode architecture:
+ *
+ *   source → edgefirstcameraadaptor → tensor_filter(ara2) → tensor_sink
+ *
+ *   No tee, no display chain. draw_masks is still invoked for timing parity
+ *   with display mode, rendering onto the unshared canvas with a NULL
+ *   background (HAL clears and draws masks only).
  *
  * This mirrors the architecture of ara2-rs/examples/yolov8_live.rs but
  * wired into GStreamer for integration with NNStreamer pipelines.
@@ -113,7 +133,6 @@ struct AppData {
   size_t tensor_ndims[MAX_TENSORS];
   size_t hal_shapes[MAX_TENSORS][8];      /* HAL-convention shapes */
   size_t hal_ndims[MAX_TENSORS];
-  bool decoder_configured;
 
   /* Display: appsink captures camera frames, appsrc pushes rendered canvas */
   hal_pixel_format srcPixelFormat;  /* detected from appsink caps */
@@ -252,6 +271,7 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps, GstBuffer *buffer)
 
   /* Build decoder */
   hal_decoder_params *params = hal_decoder_params_new();
+  if (!params) { log_error("hal_decoder_params_new failed (errno=%d)\n", errno); return false; }
   hal_decoder_params_set_score_threshold(params, CONF_THRESHOLD);
   hal_decoder_params_set_iou_threshold(params, NMS_IOU_THRESHOLD);
   hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
@@ -286,7 +306,6 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps, GstBuffer *buffer)
   log_info("HAL decoder: type=%s, normalized=%d\n", mt ? mt : "?", hal_decoder_normalized_boxes(app->decoder));
   free(mt);
 
-  app->decoder_configured = true;
   return true;
 }
 
@@ -321,25 +340,34 @@ static hal_tensor *import_camera_frame(AppData *app, GstBuffer *buf)
   if (app->srcPixelFormat == HAL_PIXEL_FORMAT_NV12) {
     guint n_mem = gst_buffer_n_memory(buf);
     if (n_mem >= 2) {
+      /* Two-fd case (v4l2h264dec on i.MX 95): each GstMemory has its own
+       * DMA-BUF fd covering only its own plane. The chroma offset within the
+       * UV fd is 0 — NOT vmeta->offset[1], which is the contiguous-buffer
+       * offset of UV relative to Y (only valid for single-buffer NV12).
+       * HAL 0.16.1 validates this and returns EIO if the offset exceeds the
+       * fd's buffer size. */
       GstMemory *mem1 = gst_buffer_peek_memory(buf, 1);
       if (gst_is_dmabuf_memory(mem1)) {
         int uv_fd = gst_dmabuf_memory_get_fd(mem1);
         chroma = hal_plane_descriptor_new(uv_fd);
-        if (chroma) {
-          if (vmeta && vmeta->n_planes >= 2) {
-            if (vmeta->offset[1] > 0)
-              hal_plane_descriptor_set_offset(chroma, vmeta->offset[1]);
-            if (vmeta->stride[1] > 0)
-              hal_plane_descriptor_set_stride(chroma, vmeta->stride[1]);
-          }
-        }
+        if (chroma && vmeta && vmeta->n_planes >= 2 && vmeta->stride[1] > 0)
+          hal_plane_descriptor_set_stride(chroma, vmeta->stride[1]);
       }
     }
+    /* Single-fd contiguous NV12 (n_mem == 1): leave chroma=NULL.
+     * HAL computes the UV offset from Y plane stride/height. */
   }
 
+  /* hal_import_image consumes the descriptors on success. On failure, the
+   * caller retains ownership and must free them. */
   hal_tensor *t = hal_import_image(app->processor, pd, chroma,
       app->srcWidth, app->srcHeight, app->srcPixelFormat, HAL_DTYPE_U8);
-  if (t) app->frameTensorCache[st.st_ino] = t;
+  if (!t) {
+    hal_plane_descriptor_free(pd);
+    if (chroma) hal_plane_descriptor_free(chroma);
+    return NULL;
+  }
+  app->frameTensorCache[st.st_ino] = t;
   return t;
 }
 
@@ -347,10 +375,20 @@ static hal_tensor *import_camera_frame(AppData *app, GstBuffer *buf)
 /* ─── Preprocessing timing probes ────────────────────────────────── */
 
 static GstPadProbeReturn preprocStartProbe(GstPad *, GstPadProbeInfo *, gpointer ud)
-{ ((AppData *)ud)->preprocStart = {}; gettimeofday(&((AppData *)ud)->preprocStart, NULL); return GST_PAD_PROBE_OK; }
+{
+  AppData *app = (AppData *)ud;
+  gettimeofday(&app->preprocStart, NULL);
+  return GST_PAD_PROBE_OK;
+}
 
 static GstPadProbeReturn preprocEndProbe(GstPad *, GstPadProbeInfo *, gpointer ud)
-{ struct timeval e; gettimeofday(&e, NULL); ((AppData *)ud)->preproc.record(timeDiffMs(((AppData *)ud)->preprocStart, e)); return GST_PAD_PROBE_OK; }
+{
+  AppData *app = (AppData *)ud;
+  struct timeval end;
+  gettimeofday(&end, NULL);
+  app->preproc.record(timeDiffMs(app->preprocStart, end));
+  return GST_PAD_PROBE_OK;
+}
 
 
 /* ─── Timing report ──────────────────────────────────────────────── */
@@ -358,23 +396,50 @@ static GstPadProbeReturn preprocEndProbe(GstPad *, GstPadProbeInfo *, gpointer u
 static void printTiming(void *userData)
 {
   AppData *app = (AppData *)userData;
-  printf("\n==============================================================================\n");
+
+  printf("\n");
+  printf("==============================================================================\n");
   printf("  YOLOV8-SEG — ARA-2 NPU + EDGEFIRST HAL (fused draw_masks)\n");
   printf("==============================================================================\n");
 
-  if (app->preproc.count > 0)
-    printf("\n  Preprocess:  %7.3f ms avg  [%d frames]\n", app->preproc.avg(), app->preproc.count);
-  if (app->inference.count > 0)
-    printf("  Inference:   %7.3f ms avg  [%d samples]\n", app->inference.avg(), app->inference.count);
-  if (app->postproc.count > 0)
-    printf("  Draw masks:  %7.3f ms avg  [%d frames]\n", app->postproc.avg(), app->postproc.count);
-  if (app->throughput.metric.count > 0) {
-    double avg = app->throughput.metric.avg();
-    printf("  End-to-end:  %7.3f ms (%5.1f FPS)  [%d frames]\n", avg, 1000.0/avg, app->throughput.metric.count);
+  printf("\n  PREPROCESSING (edgefirstcameraadaptor — fused HAL pipeline)\n");
+  printf("  --------------------------------------------------------------------------\n");
+  if (app->preproc.count > 0) {
+    printf("     Average: %7.3f ms  |  Min: %7.3f ms  |  Max: %7.3f ms  [%d frames]\n",
+           app->preproc.avg(), app->preproc.minMs, app->preproc.maxMs, app->preproc.count);
   }
-  printf("\n  Detections: %d total, %d/%d frames with detections\n",
-         app->totalDetections, app->framesWithDetections, app->totalFrames);
-  printf("==============================================================================\n");
+
+  printf("\n  INFERENCE (Ara-2 NPU)\n");
+  printf("  --------------------------------------------------------------------------\n");
+  if (app->inference.count > 0) {
+    printf("     Average: %7.3f ms  |  Min: %7.3f ms  |  Max: %7.3f ms  [%d samples]\n",
+           app->inference.avg(), app->inference.minMs, app->inference.maxMs, app->inference.count);
+  }
+
+  printf("\n  DRAW MASKS (EdgeFirst HAL — fused decode + render)\n");
+  printf("  --------------------------------------------------------------------------\n");
+  if (app->postproc.count > 0) {
+    printf("     Average: %7.3f ms  |  Min: %7.3f ms  |  Max: %7.3f ms  [%d frames]\n",
+           app->postproc.avg(), app->postproc.minMs, app->postproc.maxMs, app->postproc.count);
+  }
+
+  printf("\n  END-TO-END\n");
+  printf("  --------------------------------------------------------------------------\n");
+  if (app->throughput.metric.count > 0) {
+    double avgMs = app->throughput.metric.avg();
+    printf("     Average: %7.3f ms (%5.1f FPS)  |  Frames: %d\n",
+           avgMs, 1000.0 / avgMs, app->throughput.metric.count);
+  }
+
+  printf("\n  DETECTION STATISTICS\n");
+  printf("  --------------------------------------------------------------------------\n");
+  printf("     Post-NMS detections:     %6d  (avg %.1f/frame)\n",
+         app->totalDetections,
+         app->framesWithDetections > 0
+             ? (double)app->totalDetections / app->framesWithDetections : 0.0);
+  printf("     Frames with detections:  %6d / %d\n",
+         app->framesWithDetections, app->totalFrames);
+  printf("\n==============================================================================\n");
 }
 
 
@@ -398,8 +463,9 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
   app->throughput.tick(startTime);
   queryInferenceLatency(app->tensorFilter, app->inference);
 
-  /* Auto-configure decoder on first frame */
-  if (!app->decoder_configured) {
+  /* Auto-configure decoder on first frame. `app->decoder` is the single source
+   * of truth — once set, auto-config is skipped. */
+  if (!app->decoder) {
     GstPad *pad = gst_element_get_static_pad(element, "sink");
     GstCaps *caps = pad ? gst_pad_get_current_caps(pad) : NULL;
     if (caps) {
@@ -444,15 +510,23 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
     return;
   }
 
-  /* Pull latest camera frame from appsink for background */
+  /* Pull latest camera frame from appsink for background.
+   *
+   * IMPORTANT: the GstSample holds the only reference keeping the underlying
+   * DMA-BUF alive in our frame of control. The inode cache holds a HAL tensor
+   * that wraps the same DMA-BUF fd — HAL dups it internally but both refs
+   * point at the same physical pool pages, which v4l2h264dec recycles as
+   * soon as all GStreamer refs drop. We therefore hold the sample across the
+   * GPU draw_masks call to prevent the decoder from rewriting the pages
+   * while OpenGL is still reading them. */
   hal_tensor *background = NULL;
+  GstSample *bgSample = NULL;
   if (app->appsink) {
-    GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(app->appsink), 0);
-    if (sample) {
-      GstBuffer *frameBuf = gst_sample_get_buffer(sample);
+    bgSample = gst_app_sink_try_pull_sample(GST_APP_SINK(app->appsink), 0);
+    if (bgSample) {
+      GstBuffer *frameBuf = gst_sample_get_buffer(bgSample);
       if (frameBuf)
         background = import_camera_frame(app, frameBuf);
-      gst_sample_unref(sample);
     }
   }
 
@@ -473,7 +547,7 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
         app->processor, app->decoder,
         (const hal_tensor *const *)hal_outputs, app->tensor_count,
         app->canvas[ci], background,
-        0.5f, /* opacity */
+        MASK_OPACITY,
         app->letterbox.scale > 0 ? lb : NULL,
         HAL_COLOR_MODE_INSTANCE,
         &boxes);
@@ -483,6 +557,9 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
       if (first) { log_error("draw_masks failed (ret=%d errno=%d)\n", ret, errno); first = false; }
     }
   }
+
+  /* Safe to release the background sample now that GPU work is submitted. */
+  if (bgSample) gst_sample_unref(bgSample);
 
   /* Stats */
   app->totalFrames++;
@@ -496,7 +573,7 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
       for (size_t d = 0; d < n && d < 5; d++) {
         hal_detect_box box;
         if (hal_detect_box_list_get(boxes, d, &box) == 0) {
-          const char *name = (box.label >= 0 && box.label < NUM_CLASSES) ? cocoClassNames[box.label] : "?";
+          const char *name = (box.label < (size_t)NUM_CLASSES) ? cocoClassNames[box.label] : "?";
           log_info("  %s %.0f%%\n", name, box.score * 100.0f);
         }
       }
@@ -510,10 +587,15 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
    * Double-buffer: swap canvas so waylandsink holds one while we render the other. */
   if (app->appsrc && app->canvasFd[ci] >= 0) {
     int pushFd = dup(app->canvasFd[ci]);
-    GstMemory *mem = gst_dmabuf_allocator_alloc(app->dmabufAlloc, pushFd, app->canvasSize);
-    GstBuffer *outBuf = gst_buffer_new();
-    gst_buffer_append_memory(outBuf, mem);
-    gst_app_src_push_buffer(GST_APP_SRC(app->appsrc), outBuf);
+    if (pushFd < 0) {
+      static bool first = true;
+      if (first) { log_error("dup(canvasFd) failed: %s\n", strerror(errno)); first = false; }
+    } else {
+      GstMemory *mem = gst_dmabuf_allocator_alloc(app->dmabufAlloc, pushFd, app->canvasSize);
+      GstBuffer *outBuf = gst_buffer_new();
+      gst_buffer_append_memory(outBuf, mem);
+      gst_app_src_push_buffer(GST_APP_SRC(app->appsrc), outBuf);
+    }
   }
   app->canvasIdx = 1 - ci;
 
@@ -583,11 +665,17 @@ int main(int argc, char **argv)
   if (pargs.headless) {
     pipelineStr = g_strdup_printf("%s ! %s", srcStr, nnBranch);
   } else {
-    /* tee → appsink (camera frames) + NN branch; appsrc → waylandsink */
+    /* Pipeline pacing: `identity sync=true` blocks until each buffer's PTS
+     * matches the pipeline clock, throttling the decoder to the video's
+     * natural rate (25 FPS). Without this, file-based sources race through
+     * at decode speed. Leaky queues downstream absorb the difference between
+     * video rate and NN rate — NN processes as many frames as it can and
+     * drops the rest. Appsink just caches the latest frame for the NN
+     * callback to pull (sync=false drop=true max-buffers=1). */
     pipelineStr = g_strdup_printf(
-        "%s ! tee name=t "
+        "%s ! identity sync=true ! tee name=t "
         "t. ! queue leaky=2 max-size-buffers=1 ! "
-        "appsink name=videosink emit-signals=false drop=true max-buffers=1 sync=true "
+        "appsink name=videosink emit-signals=false drop=true max-buffers=1 sync=false "
         "t. ! %s "
         "appsrc name=display stream-type=0 format=3 is-live=true "
         "do-timestamp=true max-buffers=2 block=false ! "
@@ -616,9 +704,14 @@ int main(int argc, char **argv)
     log_info("HAL image processor ready\n");
     app.srcWidth = SOURCE_WIDTH;
     app.srcHeight = SOURCE_HEIGHT;
-    /* Video files → v4l2h264dec → NV12; camera → YUYV (both platforms) */
-    app.srcPixelFormat = (srcType == INPUT_VIDEO)
-        ? HAL_PIXEL_FORMAT_NV12 : HAL_PIXEL_FORMAT_YUYV;
+    /* Derive pixel format from the source element chosen by buildSourceElement:
+     *   libcamerasrc (i.MX 95)          → YUYV
+     *   v4l2src (i.MX 8M Plus)          → NV12
+     *   v4l2h264dec (video file)        → NV12
+     *   imagefreeze (static image)      → NV12
+     * Using the wrong format silently corrupts the GPU background render. */
+    app.srcPixelFormat = (srcType == INPUT_CAMERA_LIBCAMERA)
+        ? HAL_PIXEL_FORMAT_YUYV : HAL_PIXEL_FORMAT_NV12;
     for (int i = 0; i < AppData::NUM_CANVAS; i++) {
       app.canvas[i] = hal_image_processor_create_image(
           app.processor, app.srcWidth, app.srcHeight, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
@@ -644,9 +737,15 @@ int main(int argc, char **argv)
   app.busCtx.appData = &app;
 
   app.loop = g_main_loop_new(NULL, FALSE);
-  app.pipeline = gst_parse_launch(pipelineStr, NULL);
+  GError *parseErr = NULL;
+  app.pipeline = gst_parse_launch(pipelineStr, &parseErr);
   g_free(pipelineStr);
-  if (!app.pipeline) { log_error("Pipeline creation failed\n"); return 1; }
+  if (!app.pipeline) {
+    log_error("Pipeline creation failed: %s\n", parseErr ? parseErr->message : "(no detail)");
+    if (parseErr) g_error_free(parseErr);
+    return 1;
+  }
+  if (parseErr) g_error_free(parseErr);  /* non-fatal warnings */
 
   app.busCtx.pipeline = app.pipeline;
   app.busCtx.loop = app.loop;
@@ -657,6 +756,7 @@ int main(int argc, char **argv)
 
   /* tensor_sink */
   app.tensorSink = gst_bin_get_by_name(GST_BIN(app.pipeline), "tsink");
+  if (!app.tensorSink) { log_error("tensor_sink element not found in pipeline\n"); return 1; }
   g_signal_connect(app.tensorSink, "new-data", G_CALLBACK(newDataCallback), &app);
 
 
@@ -700,10 +800,12 @@ int main(int argc, char **argv)
                    * for initial startup but after seek we need to re-prime). */
                   if (a->appsrc && a->canvasFd[0] >= 0) {
                     int fd = dup(a->canvasFd[0]);
-                    GstMemory *mem = gst_dmabuf_allocator_alloc(a->dmabufAlloc, fd, a->canvasSize);
-                    GstBuffer *buf = gst_buffer_new();
-                    gst_buffer_append_memory(buf, mem);
-                    gst_app_src_push_buffer(GST_APP_SRC(a->appsrc), buf);
+                    if (fd >= 0) {
+                      GstMemory *mem = gst_dmabuf_allocator_alloc(a->dmabufAlloc, fd, a->canvasSize);
+                      GstBuffer *buf = gst_buffer_new();
+                      gst_buffer_append_memory(buf, mem);
+                      gst_app_src_push_buffer(GST_APP_SRC(a->appsrc), buf);
+                    }
                   }
                   return G_SOURCE_REMOVE;
                 }, app);

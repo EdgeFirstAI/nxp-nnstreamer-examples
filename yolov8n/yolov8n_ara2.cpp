@@ -282,6 +282,7 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
         scores_qp.scale, scores_qp.zeroPoint,
         boxes_qp.scale, boxes_qp.zeroPoint);
     hal_decoder_params *params = hal_decoder_params_new();
+    if (!params) { log_error("hal_decoder_params_new failed (errno=%d)\n", errno); g_free(json); return; }
     hal_decoder_params_set_config_json(params, json, 0);
     hal_decoder_params_set_score_threshold(params, CONF_THRESHOLD);
     hal_decoder_params_set_iou_threshold(params, NMS_IOU_THRESHOLD);
@@ -552,13 +553,16 @@ int main(int argc, char **argv)
   app.busCtx.appData = &app;
 
   app.loop = g_main_loop_new(NULL, FALSE);
-  app.pipeline = gst_parse_launch(pipelineStr, NULL);
+  GError *parseErr = NULL;
+  app.pipeline = gst_parse_launch(pipelineStr, &parseErr);
   g_free(pipelineStr);
 
   if (!app.pipeline) {
-    log_error("Failed to create pipeline\n");
+    log_error("Failed to create pipeline: %s\n", parseErr ? parseErr->message : "(no detail)");
+    if (parseErr) g_error_free(parseErr);
     return 1;
   }
+  if (parseErr) g_error_free(parseErr);  /* non-fatal warnings */
 
   // Configure common bus callback
   app.busCtx.pipeline = app.pipeline;
@@ -571,8 +575,8 @@ int main(int argc, char **argv)
 
   // tensor_sink
   GstElement *tsink = gst_bin_get_by_name(GST_BIN(app.pipeline), "inferenceOutput");
+  if (!tsink) { log_error("tensor_sink element not found in pipeline\n"); return 1; }
   g_signal_connect(tsink, "new-data", G_CALLBACK(newDataCallback), &app);
-
   gst_object_unref(tsink);
 
   // Cairo overlay
