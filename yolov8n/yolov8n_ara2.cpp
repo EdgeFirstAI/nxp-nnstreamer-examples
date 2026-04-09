@@ -327,43 +327,25 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
              app->out_shapes[1][2]);
   }
 
-  // Wrap output tensors as HAL tensors
+  // Wrap output tensors — create fresh each frame, free in cleanup.
+  // No cache: avoids use-after-free across seek boundaries.
+  // HAL dups the fd internally so this is safe.
   hal_tensor *hal_outputs[NUM_OUTPUTS] = {NULL, NULL};
-  GstMapInfo out_maps[NUM_OUTPUTS];
-  gboolean out_mapped[NUM_OUTPUTS] = {FALSE, FALSE};
   hal_detect_box_list *boxes = NULL;
   int decode_ret = -1;
 
   for (int j = 0; j < NUM_OUTPUTS; j++) {
     GstMemory *mem = gst_buffer_peek_memory(buffer, j);
 
-    if (gst_is_dmabuf_memory(mem)) {
-      int fd = gst_dmabuf_memory_get_fd(mem);
-      hal_outputs[j] = hal_tensor_from_fd(
-          app->out_dtypes[j], dup(fd),
-          app->out_shapes[j], app->out_ndims[j], NULL);
-    } else {
-      if (!gst_memory_map(mem, &out_maps[j], GST_MAP_READ)) {
-        log_error("Cannot map output tensor %d\n", j);
-        goto cleanup;
-      }
-      out_mapped[j] = TRUE;
-
-      hal_outputs[j] = hal_tensor_new(
-          app->out_dtypes[j], app->out_shapes[j],
-          app->out_ndims[j], HAL_TENSOR_MEMORY_MEM, NULL);
-
-      if (hal_outputs[j]) {
-        hal_tensor_map *tmap = hal_tensor_map_create(hal_outputs[j]);
-        if (tmap) {
-          void *dst = hal_tensor_map_data(tmap);
-          if (dst)
-            memcpy(dst, out_maps[j].data, out_maps[j].size);
-          hal_tensor_map_unmap(tmap);
-        }
-      }
+    if (!gst_is_dmabuf_memory(mem)) {
+      log_error("Output tensor %d is not DMA-BUF\n", j);
+      goto cleanup;
     }
 
+    int fd = gst_dmabuf_memory_get_fd(mem);
+    hal_outputs[j] = hal_tensor_from_fd(
+        app->out_dtypes[j], fd,
+        app->out_shapes[j], app->out_ndims[j], NULL);
     if (!hal_outputs[j]) {
       log_error("Failed to create HAL tensor for output %d\n", j);
       goto cleanup;
@@ -395,8 +377,6 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
     for (size_t d = 0; d < num_dets; d++) {
       hal_detect_box box;
       if (hal_detect_box_list_get(boxes, d, &box) == 0) {
-        /* HAL decoder with normalized:false returns model pixel coords
-         * directly — do NOT multiply by MODEL_INPUT_SIZE. */
         float px = (box.xmin - app->letterbox.padX) / app->letterbox.scale;
         float py = (box.ymin - app->letterbox.padY) / app->letterbox.scale;
         float bw = (box.xmax - box.xmin) / app->letterbox.scale;
@@ -416,10 +396,6 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
       if (boxes) hal_detect_box_list_free(boxes);
       for (int j = 0; j < NUM_OUTPUTS; j++) {
         if (hal_outputs[j]) hal_tensor_free(hal_outputs[j]);
-      }
-      for (int j = 0; j < NUM_OUTPUTS; j++) {
-        if (out_mapped[j])
-          gst_memory_unmap(gst_buffer_peek_memory(buffer, j), &out_maps[j]);
       }
       g_main_loop_quit(app->loop);
       return;
@@ -452,13 +428,10 @@ cleanup:
     if (hal_outputs[j])
       hal_tensor_free(hal_outputs[j]);
   }
-  for (int j = 0; j < NUM_OUTPUTS; j++) {
-    if (out_mapped[j])
-      gst_memory_unmap(gst_buffer_peek_memory(buffer, j), &out_maps[j]);
-  }
 
   gettimeofday(&endTime, NULL);
   app->postproc.record(timeDiffMs(startTime, endTime));
+
 }
 
 
@@ -572,7 +545,7 @@ int main(int argc, char **argv)
 
   bool startedOnce = false;
   app.busCtx.playing = &app.playing;
-  app.busCtx.startedOnce = pargs.headless ? NULL : &startedOnce;
+  app.busCtx.startedOnce = &startedOnce;
   app.busCtx.videoLoop = !pargs.video.empty() && pargs.image.empty();
   app.busCtx.videoRate = 1.0;
   app.busCtx.printTiming = NULL;  // print after pipeline teardown
@@ -599,9 +572,10 @@ int main(int argc, char **argv)
   // tensor_sink
   GstElement *tsink = gst_bin_get_by_name(GST_BIN(app.pipeline), "inferenceOutput");
   g_signal_connect(tsink, "new-data", G_CALLBACK(newDataCallback), &app);
+
   gst_object_unref(tsink);
 
-  // Cairo overlay (only when displaying)
+  // Cairo overlay
   if (!pargs.headless) {
     GstElement *cairo = gst_bin_get_by_name(GST_BIN(app.pipeline), "cairo");
     if (cairo) {

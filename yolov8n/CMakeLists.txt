@@ -13,6 +13,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0)
 pkg_check_modules(GST_ALLOC REQUIRED gstreamer-allocators-1.0)
 pkg_check_modules(GST_APP REQUIRED gstreamer-app-1.0)
+pkg_check_modules(GST_VIDEO REQUIRED gstreamer-video-1.0)
 pkg_check_modules(CAIRO REQUIRED cairo)
 pkg_check_modules(NNSTREAMER REQUIRED nnstreamer)
 pkg_check_modules(EDGEFIRST_GST REQUIRED edgefirst-gstreamer-1.0)
@@ -139,6 +140,7 @@ target_link_libraries(yolov8n_seg_ara2
   ${GSTREAMER_LIBRARIES}
   ${GST_ALLOC_LIBRARIES}
   ${GST_APP_LIBRARIES}
+  ${GST_VIDEO_LIBRARIES}
   ${NNSTREAMER_LIBRARIES}
   edgefirst_hal
 )

@@ -38,7 +38,7 @@
 
 /* ─── Post-processing thresholds ──────────────────────────────────── */
 
-#define CONF_THRESHOLD      0.25f
+#define CONF_THRESHOLD      0.50f
 #define NMS_IOU_THRESHOLD   0.45f
 
 /* ─── Default source video dimensions ─────────────────────────────── */
