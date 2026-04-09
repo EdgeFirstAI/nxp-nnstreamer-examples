@@ -38,8 +38,9 @@
 
 /* ─── Post-processing thresholds ──────────────────────────────────── */
 
-#define CONF_THRESHOLD      0.50f
+#define CONF_THRESHOLD      0.25f
 #define NMS_IOU_THRESHOLD   0.45f
+#define MASK_OPACITY        0.5f    // Segmentation mask blend alpha [0..1]
 
 /* ─── Default source video dimensions ─────────────────────────────── */
 
@@ -231,7 +232,8 @@ struct PtsTracker {
 struct hal_image_processor;
 struct hal_tensor;
 
-/** @brief Context for GPU-accelerated segmentation mask overlay rendering */
+/** @brief Context for GPU-accelerated segmentation mask overlay rendering
+ *         (used by yolov8n_imx8mp / yolov8n_imx95 CPU-copy binaries). */
 struct SegContext {
   hal_image_processor *processor;   // GPU image processor
   hal_tensor *overlay;              // PBO-backed RGBA overlay tensor
