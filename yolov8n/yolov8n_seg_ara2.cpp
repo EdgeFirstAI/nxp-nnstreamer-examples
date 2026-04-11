@@ -109,6 +109,9 @@ struct AppData {
   TimingMetric postproc;
   struct timeval preprocStart;
 
+  // Per-element + full pipeline latency (shared helper)
+  PipelineProbes probes;
+
   int totalDetections;
   int framesWithDetections;
   int totalFrames;
@@ -462,6 +465,7 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
 
   app->throughput.tick(startTime);
   queryInferenceLatency(app->tensorFilter, app->inference);
+  app->probes.recordInference();
 
   /* Auto-configure decoder on first frame. `app->decoder` is the single source
    * of truth — once set, auto-config is skipped. */
@@ -611,6 +615,7 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
 
   gettimeofday(&endTime, NULL);
   app->postproc.record(timeDiffMs(startTime, endTime));
+  app->probes.recordPost(startTime, endTime);
 }
 
 
@@ -693,6 +698,7 @@ int main(int argc, char **argv)
   app.maxFrames = pargs.numFrames;
   app.headless = pargs.headless;
   app.preproc.reset(); app.inference.reset(); app.postproc.reset(); app.throughput.reset();
+  app.probes.reset();
 
   /* Always create image processor + canvas for draw_masks (decode + render).
    * Headless mode still decodes and renders to the canvas but doesn't push
@@ -762,6 +768,8 @@ int main(int argc, char **argv)
 
   /* tensor_filter */
   app.tensorFilter = gst_bin_get_by_name(GST_BIN(app.pipeline), "tfilter");
+  // Shared per-element + full pipeline latency probes
+  app.probes.install(app.pipeline, "thread-nn", "preproc", "tfilter");
 
   /* appsink for camera frames + appsrc for display (display mode only) */
   if (!pargs.headless) {
@@ -833,6 +841,8 @@ int main(int argc, char **argv)
 
   /* Cleanup */
   gst_element_set_state(app.pipeline, GST_STATE_NULL);
+  app.probes.printReport("YOLOv8-seg ARA-2 NPU + EDGEFIRST HAL (per-element probes)");
+  app.probes.teardown();
   printTiming(&app);
 
   for (auto &kv : app.frameTensorCache) hal_tensor_free(kv.second);

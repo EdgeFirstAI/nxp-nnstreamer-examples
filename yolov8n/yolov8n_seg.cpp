@@ -69,6 +69,9 @@ struct AppData {
   /* Infrastructure */
   BusCallbackCtx busCtx;
   bool timingPrinted;
+
+  /* Per-element + full pipeline latency (shared helper) */
+  PipelineProbes probes;
 };
 
 
@@ -156,6 +159,7 @@ static void onNewDetection(GstElement *,
 
   /* Query inference latency each frame */
   queryInferenceLatency(app->tensorFilter, app->inference);
+  app->probes.recordInference();
 
   app->frameCount++;
 
@@ -202,6 +206,12 @@ static void onNewDetection(GstElement *,
       edgefirst_detect_box_free(box);
     }
   }
+
+  /* Shared full-latency tracking: now == callback start, use a fresh
+   * end timestamp so recordPost gets a non-zero delta. */
+  struct timeval cbEnd;
+  gettimeofday(&cbEnd, NULL);
+  app->probes.recordPost(now, cbEnd);
 
   /* Frame count limit: send EOS when reached */
   if (app->numFrames > 0 && app->frameCount >= app->numFrames)
@@ -312,6 +322,7 @@ int main(int argc, char **argv)
   app.e2e.reset();
   app.throughput.reset();
   app.ptsTracker.init();
+  app.probes.reset();
 
   bool startedOnce = false;
   app.busCtx.pipeline    = pipeline;
@@ -362,6 +373,10 @@ int main(int argc, char **argv)
     }
   }
 
+  /* Shared per-element + full pipeline latency probes.
+   * yolov8n_seg uses the inference-branch element names q-nn / ca / tfilter. */
+  app.probes.install(pipeline, "q-nn", "ca", "tfilter");
+
   /* ---- Run ---- */
 
   gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -373,6 +388,8 @@ int main(int argc, char **argv)
 
   if (app.instrumented)
     printTimingReport(&app);
+  app.probes.printReport("YOLOv8n-seg — EdgeFirst Overlay Pipeline (per-element probes)");
+  app.probes.teardown();
 
   gst_object_unref(overlay);
   gst_object_unref(ca);

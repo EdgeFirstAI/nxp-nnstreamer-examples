@@ -102,6 +102,9 @@ typedef struct {
   ThroughputTracker throughput;
   PtsTracker ptsTracker;
 
+  // Per-element + full pipeline latency (shared helper)
+  PipelineProbes probes;
+
   // HAL decoder
   hal_decoder *decoder;
 
@@ -260,8 +263,9 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   // Frame-to-frame interval
   app->throughput.tick(callbackStart);
 
-  // Inference latency
+  // Inference latency (record both for back-compat TimingStats and shared probes)
   queryInferenceLatency(app->tensorFilter, app->timing.inference);
+  app->probes.recordInference();
 
   // Validate buffer
   if (!GST_IS_BUFFER(buffer)) { log_error("Invalid buffer\n"); return; }
@@ -367,6 +371,8 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   struct timeval postEnd;
   gettimeofday(&postEnd, NULL);
   app->timing.postprocTotal.record(timeDiffMs(callbackStart, postEnd));
+  // Shared per-element + full pipeline latency (race-safe)
+  app->probes.recordPost(callbackStart, postEnd);
 
   // PTS-correlated E2E
   struct timeval ptsStart;
@@ -511,6 +517,7 @@ int main(int argc, char **argv)
   app.timing.e2ePipeline.reset();
   app.throughput.reset();
   app.ptsTracker.init();
+  app.probes.reset();
 
   bool startedOnce = false;
   app.busCtx.playing = &app.playing;
@@ -555,6 +562,8 @@ int main(int argc, char **argv)
 
   // Install probes (always — needed for E2E PTS correlation)
   installProbes(&app);
+  // Install shared per-element + full pipeline latency probes
+  app.probes.install(app.gstPipeline, "thread-nn", "preproc", "tfilter");
 
   g_unix_signal_add(SIGINT, commonSigintHandler, &app.busCtx);
 
@@ -566,6 +575,8 @@ int main(int argc, char **argv)
   gst_element_set_state(app.gstPipeline, GST_STATE_NULL);
   if (app.instrumented)
     printTimingStatistics(&app);
+  app.probes.printReport("EDGEFIRST CAMERAADAPTOR + HAL — i.MX 95 Neutron (per-element probes)");
+  app.probes.teardown();
   if (app.tensorFilter)
     gst_object_unref(app.tensorFilter);
   if (app.cameraadaptor)

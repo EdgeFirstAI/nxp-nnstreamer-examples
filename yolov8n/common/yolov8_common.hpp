@@ -250,6 +250,103 @@ struct SegContext {
 void queryInferenceLatency(GstElement *tensorFilter, TimingMetric &metric);
 
 
+/* ─── Per-element pipeline probes (full + per-element latency) ────── */
+
+/**
+ * @brief Per-element pipeline latency probes for the standard NN branch.
+ *
+ * Installs pad probes on the standard EdgeFirst optimized NN branch
+ * elements (queue → preproc → tensor_filter → tensor_sink) to report
+ * per-element sink→src latencies plus a race-safe full pipeline latency
+ * (queue sink → end of post-processing).
+ *
+ * Pipeline shape this targets:
+ *
+ *   src → queue(name=thread-nn) → edgefirstcameraadaptor(name=preproc)
+ *      → tensor_filter(name=tfilter) → tensor_sink(name=inferenceOutput)
+ *
+ * Race safety: queueSinkStart is captured on the upstream thread when a
+ * new buffer arrives at the queue input. Because that can fire while
+ * the downstream chain is still processing the previous buffer, we
+ * snapshot queueSinkStart into currentFrameQueueStart inside the queue
+ * src probe (which fires on the downstream thread the moment the
+ * buffer leaves the queue). The tensor_sink callback then reads
+ * currentFrameQueueStart, which is stable for the lifetime of the
+ * downstream processing of one buffer.
+ */
+struct PipelineProbes {
+  // Per-stage timing metrics (sink → src for each element)
+  TimingMetric queueDwell;       // queue sink → queue src
+  TimingMetric preproc;          // preproc element sink → src
+  TimingMetric filterElement;    // tensor_filter element sink → src
+  TimingMetric inference;        // tensor_filter internal latency (pure NPU Invoke)
+  TimingMetric postproc;         // tensor_sink callback total time
+  TimingMetric fullLatency;      // queue sink → end of post-processing
+
+  // Per-buffer probe state (set by upstream/downstream-thread probes)
+  struct timeval queueSinkStart;
+  struct timeval queueSrcEnd;
+  struct timeval preprocStart;
+  struct timeval preprocEnd;
+  struct timeval filterSinkStart;
+  struct timeval filterSrcEnd;
+  // Snapshot of queueSinkStart taken on the downstream thread inside
+  // the queue src probe — race-safe for full-latency measurement.
+  struct timeval currentFrameQueueStart;
+
+  // tensor_filter element kept for queryInferenceLatency()
+  GstElement *tensorFilter;
+
+  void reset();
+
+  /**
+   * @brief Install pad probes on the named elements.
+   *
+   * Each name is the gst element `name=` value used in the pipeline
+   * string. Any name may be NULL to skip that element's probes (useful
+   * for binaries that don't have a thread queue or use a different
+   * structure).
+   *
+   * @param pipeline    Top-level GstPipeline
+   * @param queueName   queue element name (typically "thread-nn"), or NULL
+   * @param preprocName edgefirstcameraadaptor element name (typically "preproc"), or NULL
+   * @param filterName  tensor_filter element name (typically "tfilter"), or NULL
+   * @return true on success
+   */
+  bool install(GstElement *pipeline,
+               const char *queueName,
+               const char *preprocName,
+               const char *filterName);
+
+  /** Release the cached tensor_filter reference. */
+  void teardown();
+
+  /**
+   * @brief Record post-processing time + full pipeline latency.
+   *
+   * Call this from the tensor_sink new-data callback after the post-
+   * processing work has completed. It records the post duration and
+   * also computes the per-buffer full pipeline latency from the
+   * race-safe currentFrameQueueStart snapshot.
+   */
+  void recordPost(const struct timeval &postStart, const struct timeval &postEnd);
+
+  /**
+   * @brief Query and record the tensor_filter `latency` property.
+   * Call this from the tensor_sink new-data callback alongside
+   * recordPost(). Reports the pure NPU Invoke time independent of
+   * gstreamer element overhead.
+   */
+  void recordInference();
+
+  /**
+   * @brief Print the unified per-element + full latency report.
+   * @param title   Section title (e.g. "KINARA ARA-2 NPU + EDGEFIRST")
+   */
+  void printReport(const char *title) const;
+};
+
+
 /* ─── Source Element Construction ─────────────────────────────────── */
 
 /** @brief Input source type */

@@ -107,17 +107,14 @@ struct AppData {
   BusCallbackCtx busCtx;
   ThroughputTracker throughput;
 
-  TimingMetric preproc;
-  TimingMetric inference;
-  TimingMetric postproc;
-  struct timeval preprocStart;
+  // Per-element pad-probe pipeline latency tracking
+  PipelineProbes probes;
 
   int totalDetections;
   int framesWithDetections;
   int totalFrames;
   int maxFrames;
 
-  GstElement *tensorFilter;
   GstElement *cameraadaptor;
   LetterboxParams letterbox;
 
@@ -137,25 +134,8 @@ struct AppData {
 };
 
 
-/* --- Preprocessing timing probes ----------------------------------------- */
-
-static GstPadProbeReturn
-preprocStartProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  gettimeofday(&app->preprocStart, NULL);
-  return GST_PAD_PROBE_OK;
-}
-
-static GstPadProbeReturn
-preprocEndProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
-{
-  AppData *app = (AppData *)user_data;
-  struct timeval end;
-  gettimeofday(&end, NULL);
-  app->preproc.record(timeDiffMs(app->preprocStart, end));
-  return GST_PAD_PROBE_OK;
-}
+/* All per-element pad-probe instrumentation lives in the shared
+ * PipelineProbes helper in yolov8_common.{hpp,cpp}. */
 
 
 /* --- Timing report ------------------------------------------------------- */
@@ -164,37 +144,13 @@ static void printTiming(void *userData)
 {
   AppData *app = (AppData *)userData;
 
-  printf("\n");
-  printf("==============================================================================\n");
-  printf("  KINARA ARA-2 NPU + EDGEFIRST CAMERAADAPTOR + HAL\n");
-  printf("==============================================================================\n");
+  app->probes.printReport("KINARA ARA-2 NPU + EDGEFIRST CAMERAADAPTOR + HAL");
 
-  printf("\n  PREPROCESSING (edgefirstcameraadaptor — fused HAL pipeline)\n");
-  printf("  --------------------------------------------------------------------------\n");
-  if (app->preproc.count > 0) {
-    printf("     Average: %7.3f ms  |  Min: %7.3f ms  |  Max: %7.3f ms  [%d frames]\n",
-           app->preproc.avg(), app->preproc.minMs, app->preproc.maxMs, app->preproc.count);
-  }
-
-  printf("\n  INFERENCE (Ara-2 NPU)\n");
-  printf("  --------------------------------------------------------------------------\n");
-  if (app->inference.count > 0) {
-    printf("     Average: %7.3f ms  |  Min: %7.3f ms  |  Max: %7.3f ms  [%d samples]\n",
-           app->inference.avg(), app->inference.minMs, app->inference.maxMs, app->inference.count);
-  }
-
-  printf("\n  POST-PROCESSING (EdgeFirst HAL — quantized NMS)\n");
-  printf("  --------------------------------------------------------------------------\n");
-  if (app->postproc.count > 0) {
-    printf("     Average: %7.3f ms  |  Min: %7.3f ms  |  Max: %7.3f ms  [%d frames]\n",
-           app->postproc.avg(), app->postproc.minMs, app->postproc.maxMs, app->postproc.count);
-  }
-
-  printf("\n  END-TO-END\n");
+  printf("\n  END-TO-END THROUGHPUT\n");
   printf("  --------------------------------------------------------------------------\n");
   if (app->throughput.metric.count > 0) {
     double avgMs = app->throughput.metric.avg();
-    printf("     Average: %7.3f ms (%5.1f FPS)  |  Frames: %d\n",
+    printf("     frame-to-frame interval                               avg %7.3f ms (%5.1f FPS)  [%d]\n",
            avgMs, 1000.0 / avgMs, app->throughput.metric.count);
   }
 
@@ -258,8 +214,8 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   // Frame-to-frame interval
   app->throughput.tick(startTime);
 
-  // Inference latency
-  queryInferenceLatency(app->tensorFilter, app->inference);
+  // Inference latency (queries the cached tensor_filter inside probes)
+  app->probes.recordInference();
 
   // Validate buffer — expect 2 memory blocks (scores + boxes)
   if (!GST_IS_BUFFER(buffer)) { log_error("Invalid buffer\n"); return; }
@@ -393,7 +349,7 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
         app->totalDetections += num_dets;
       }
       gettimeofday(&endTime, NULL);
-      app->postproc.record(timeDiffMs(startTime, endTime));
+      app->probes.recordPost(startTime, endTime);
       if (boxes) hal_detect_box_list_free(boxes);
       for (int j = 0; j < NUM_OUTPUTS; j++) {
         if (hal_outputs[j]) hal_tensor_free(hal_outputs[j]);
@@ -431,8 +387,10 @@ cleanup:
   }
 
   gettimeofday(&endTime, NULL);
-  app->postproc.record(timeDiffMs(startTime, endTime));
-
+  // Records post-processing duration AND the race-safe full pipeline
+  // latency (queue sink → here, via the snapshot taken in the queue
+  // src probe on this same downstream thread).
+  app->probes.recordPost(startTime, endTime);
 }
 
 
@@ -444,7 +402,8 @@ int main(int argc, char **argv)
   pargs.camera = "";  // Will be set from platform default
 
   uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO | ARG_IMAGE |
-                   ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES | ARG_PLATFORM;
+                   ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES |
+                   ARG_PLATFORM | ARG_COMPUTE;
 
   int ret = parseArgs(argc, argv, flags,
       "YOLOv8n 640x640 for Kinara Ara-2 NPU — EdgeFirst CameraAdaptor + HAL", pargs);
@@ -505,15 +464,21 @@ int main(int argc, char **argv)
   InputSource srcType = determineInputSource(pargs, plat.usesLibcamerasrc);
   char *srcStr = buildSourceElement(srcType, pargs);
 
+  // Optional edgefirstcameraadaptor compute-backend override (auto/opengl/g2d/cpu)
+  std::string computeProp;
+  if (!pargs.compute.empty())
+    computeProp = std::string(" compute=") + pargs.compute;
+
   // Build NN processing branch
   char *nnBranch = g_strdup_printf(
       "queue name=thread-nn leaky=2 max-size-buffers=2 ! "
       "edgefirstcameraadaptor name=preproc model-width=%d model-height=%d "
-      "model-dtype=int8 model-layout=chw letterbox=true ! "
+      "model-dtype=int8 model-layout=chw letterbox=true%s ! "
       "tensor_filter name=tfilter framework=ara2 model=%s "
       "custom=EnableStats:true latency=1 ! "
       "tensor_sink name=inferenceOutput",
       MODEL_INPUT_SIZE, MODEL_INPUT_SIZE,
+      computeProp.c_str(),
       pargs.model.c_str());
 
   // Build full pipeline
@@ -539,9 +504,7 @@ int main(int argc, char **argv)
   AppData app = {};
   app.maxFrames = pargs.numFrames;
   app.headless = pargs.headless;
-  app.preproc.reset();
-  app.inference.reset();
-  app.postproc.reset();
+  app.probes.reset();
   app.throughput.reset();
 
   bool startedOnce = false;
@@ -588,23 +551,13 @@ int main(int argc, char **argv)
     }
   }
 
-  // tensor_filter for latency query
-  app.tensorFilter = gst_bin_get_by_name(GST_BIN(app.pipeline), "tfilter");
+  // Install per-element pad probes via shared PipelineProbes helper.
+  // Targets the standard EdgeFirst NN branch elements:
+  //   queue(thread-nn) → preproc → tfilter → tensor_sink
+  app.probes.install(app.pipeline, "thread-nn", "preproc", "tfilter");
 
-  // Preprocessing timing probes (cameraadaptor sink → src)
+  // Keep cameraadaptor reference for letterbox query in the callback.
   app.cameraadaptor = gst_bin_get_by_name(GST_BIN(app.pipeline), "preproc");
-  if (app.cameraadaptor) {
-    GstPad *sinkPad = gst_element_get_static_pad(app.cameraadaptor, "sink");
-    GstPad *srcPad = gst_element_get_static_pad(app.cameraadaptor, "src");
-    if (sinkPad) {
-      gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, preprocStartProbe, &app, NULL);
-      gst_object_unref(sinkPad);
-    }
-    if (srcPad) {
-      gst_pad_add_probe(srcPad, GST_PAD_PROBE_TYPE_BUFFER, preprocEndProbe, &app, NULL);
-      gst_object_unref(srcPad);
-    }
-  }
 
   g_unix_signal_add(SIGINT, commonSigintHandler, &app.busCtx);
 
@@ -615,8 +568,7 @@ int main(int argc, char **argv)
   // Cleanup — tear down pipeline first so waylandsink stats print before ours
   gst_element_set_state(app.pipeline, GST_STATE_NULL);
   printTiming(&app);
-  if (app.tensorFilter)
-    gst_object_unref(app.tensorFilter);
+  app.probes.teardown();
   if (app.cameraadaptor)
     gst_object_unref(app.cameraadaptor);
   gst_object_unref(app.bus);
