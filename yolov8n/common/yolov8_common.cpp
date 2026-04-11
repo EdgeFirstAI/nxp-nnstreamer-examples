@@ -349,6 +349,180 @@ void queryInferenceLatency(GstElement *tensorFilter, TimingMetric &metric) {
 }
 
 
+/* ─── PipelineProbes: per-element + full pipeline latency ─────────── */
+
+static GstPadProbeReturn
+pp_queueSinkProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
+{
+  PipelineProbes *p = (PipelineProbes *)user_data;
+  gettimeofday(&p->queueSinkStart, NULL);
+  return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn
+pp_queueSrcProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
+{
+  PipelineProbes *p = (PipelineProbes *)user_data;
+  gettimeofday(&p->queueSrcEnd, NULL);
+  p->queueDwell.record(timeDiffMs(p->queueSinkStart, p->queueSrcEnd));
+  // Race-safe snapshot for fullLatency: we're now on the downstream
+  // thread, and the buffer is committed to this processing cycle.
+  // queueSinkStart can be safely overwritten by upstream after this
+  // assignment without affecting the in-flight buffer's measurement.
+  p->currentFrameQueueStart = p->queueSinkStart;
+  return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn
+pp_preprocSinkProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
+{
+  PipelineProbes *p = (PipelineProbes *)user_data;
+  gettimeofday(&p->preprocStart, NULL);
+  return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn
+pp_preprocSrcProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
+{
+  PipelineProbes *p = (PipelineProbes *)user_data;
+  gettimeofday(&p->preprocEnd, NULL);
+  p->preproc.record(timeDiffMs(p->preprocStart, p->preprocEnd));
+  return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn
+pp_filterSinkProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
+{
+  PipelineProbes *p = (PipelineProbes *)user_data;
+  gettimeofday(&p->filterSinkStart, NULL);
+  return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn
+pp_filterSrcProbe(GstPad *, GstPadProbeInfo *, gpointer user_data)
+{
+  PipelineProbes *p = (PipelineProbes *)user_data;
+  gettimeofday(&p->filterSrcEnd, NULL);
+  p->filterElement.record(timeDiffMs(p->filterSinkStart, p->filterSrcEnd));
+  return GST_PAD_PROBE_OK;
+}
+
+void PipelineProbes::reset()
+{
+  queueDwell.reset();
+  preproc.reset();
+  filterElement.reset();
+  inference.reset();
+  postproc.reset();
+  fullLatency.reset();
+  queueSinkStart = {};
+  queueSrcEnd = {};
+  preprocStart = {};
+  preprocEnd = {};
+  filterSinkStart = {};
+  filterSrcEnd = {};
+  currentFrameQueueStart = {};
+  tensorFilter = nullptr;
+}
+
+/** Helper: install a probe pair (sink+src) on a named element. */
+static void install_pad_probe(GstElement *pipeline, const char *elementName,
+                              const char *padName, GstPadProbeCallback cb,
+                              gpointer user_data)
+{
+  if (!elementName) return;
+  GstElement *elem = gst_bin_get_by_name(GST_BIN(pipeline), elementName);
+  if (!elem) {
+    g_printerr("PipelineProbes: element '%s' not found\n", elementName);
+    return;
+  }
+  GstPad *pad = gst_element_get_static_pad(elem, padName);
+  if (pad) {
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, cb, user_data, NULL);
+    gst_object_unref(pad);
+  }
+  gst_object_unref(elem);
+}
+
+bool PipelineProbes::install(GstElement *pipeline,
+                             const char *queueName,
+                             const char *preprocName,
+                             const char *filterName)
+{
+  if (!pipeline) return false;
+
+  install_pad_probe(pipeline, queueName,   "sink", pp_queueSinkProbe,   this);
+  install_pad_probe(pipeline, queueName,   "src",  pp_queueSrcProbe,    this);
+  install_pad_probe(pipeline, preprocName, "sink", pp_preprocSinkProbe, this);
+  install_pad_probe(pipeline, preprocName, "src",  pp_preprocSrcProbe,  this);
+  install_pad_probe(pipeline, filterName,  "sink", pp_filterSinkProbe,  this);
+  install_pad_probe(pipeline, filterName,  "src",  pp_filterSrcProbe,   this);
+
+  // Cache tensor_filter ref for inference latency queries.
+  if (filterName) {
+    tensorFilter = gst_bin_get_by_name(GST_BIN(pipeline), filterName);
+  }
+  return true;
+}
+
+void PipelineProbes::teardown()
+{
+  if (tensorFilter) {
+    gst_object_unref(tensorFilter);
+    tensorFilter = nullptr;
+  }
+}
+
+void PipelineProbes::recordPost(const struct timeval &postStart,
+                                const struct timeval &postEnd)
+{
+  postproc.record(timeDiffMs(postStart, postEnd));
+
+  // Per-buffer full pipeline latency, race-safe via the snapshot taken
+  // in the queue src probe (downstream thread). currentFrameQueueStart
+  // is stable for the lifetime of this buffer's downstream processing.
+  if (currentFrameQueueStart.tv_sec != 0)
+    fullLatency.record(timeDiffMs(currentFrameQueueStart, postEnd));
+}
+
+void PipelineProbes::recordInference()
+{
+  queryInferenceLatency(tensorFilter, inference);
+}
+
+static void pp_print_metric(const char *label, const TimingMetric &m)
+{
+  if (m.count > 0) {
+    printf("     %-52s  avg %7.3f ms  min %7.3f ms  max %7.3f ms  [%d]\n",
+           label, m.avg(), m.minMs, m.maxMs, m.count);
+  } else {
+    printf("     %-52s  (no samples)\n", label);
+  }
+}
+
+void PipelineProbes::printReport(const char *title) const
+{
+  printf("\n");
+  printf("==============================================================================\n");
+  printf("  %s\n", title ? title : "Pipeline timing report");
+  printf("==============================================================================\n");
+
+  printf("\n  PER-ELEMENT PIPELINE LATENCY (pad-probe measured)\n");
+  printf("  --------------------------------------------------------------------------\n");
+  pp_print_metric("queue (thread-nn dwell)",            queueDwell);
+  pp_print_metric("edgefirstcameraadaptor (preproc)",   preproc);
+  pp_print_metric("tensor_filter element (GST total)",  filterElement);
+  pp_print_metric("  └─ NPU Invoke (internal latency)", inference);
+  pp_print_metric("tensor_sink callback (post-process)",postproc);
+
+  printf("\n  FULL PIPELINE LATENCY (queue sink → end of post-processing)\n");
+  printf("  --------------------------------------------------------------------------\n");
+  pp_print_metric("full per-buffer latency",            fullLatency);
+
+  printf("\n==============================================================================\n");
+}
+
+
 /* ─── Source Element Construction ─────────────────────────────────── */
 
 InputSource determineInputSource(const ParsedArgs &args, bool usesLibcamerasrc) {

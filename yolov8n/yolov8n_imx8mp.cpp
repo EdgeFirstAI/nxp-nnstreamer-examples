@@ -184,6 +184,9 @@ typedef struct {
   ThroughputTracker throughput;
   PtsTracker ptsTracker;
 
+  // Per-element + full pipeline latency (shared helper)
+  PipelineProbes probes;
+
   // HAL decoder
   hal_decoder *decoder;
   bool decoderInitFailed;
@@ -367,6 +370,7 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
 
   // Inference latency
   queryInferenceLatency(app->tensorFilter, app->timing.inference);
+  app->probes.recordInference();
 
   // Validate buffer
   if (!GST_IS_BUFFER(buffer)) { log_error("Invalid buffer\n"); return; }
@@ -568,6 +572,8 @@ static void newDataCallback(GstElement *, GstBuffer *buffer, gpointer user_data)
   struct timeval postEnd;
   gettimeofday(&postEnd, NULL);
   app->timing.postprocTotal.record(timeDiffMs(callbackStart, postEnd));
+  // Shared per-element + full pipeline latency (race-safe)
+  app->probes.recordPost(callbackStart, postEnd);
 
   // PTS-correlated E2E
   struct timeval ptsStart;
@@ -741,6 +747,7 @@ int main(int argc, char **argv)
   app.timing.e2ePipeline.reset();
   app.throughput.reset();
   app.ptsTracker.init();
+  app.probes.reset();
 
   // Initialize seg context if --seg requested
   if (pargs.segmentation)
@@ -777,6 +784,8 @@ int main(int argc, char **argv)
   gst_object_unref(tsink);
 
   app.tensorFilter = gst_bin_get_by_name(GST_BIN(app.gstPipeline), "tfilter");
+  // Install shared per-element + full pipeline latency probes
+  app.probes.install(app.gstPipeline, "thread-nn", "preproc", "tfilter");
 
   // Connect cairo overlay for display mode
   if (!pargs.headless) {
@@ -823,6 +832,8 @@ int main(int argc, char **argv)
   gst_element_set_state(app.gstPipeline, GST_STATE_NULL);
   if (app.instrumented)
     printTimingStatistics(&app);
+  app.probes.printReport("EDGEFIRST CAMERAADAPTOR + HAL — i.MX 8M Plus VSI (per-element probes)");
+  app.probes.teardown();
   if (app.tensorFilter)
     gst_object_unref(app.tensorFilter);
   gst_object_unref(app.bus);
