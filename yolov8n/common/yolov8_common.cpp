@@ -560,12 +560,12 @@ char *buildSourceElement(InputSource source, const ParsedArgs &args,
       if (numBuffers > 0) {
         return g_strdup_printf(
             "v4l2src device=%s num-buffers=%d ! "
-            "video/x-raw,format=NV12,width=%d,height=%d,framerate=30/1",
+            "video/x-raw,format=YUY2,width=%d,height=%d,framerate=30/1",
             args.camera.c_str(), numBuffers, srcWidth, srcHeight);
       }
       return g_strdup_printf(
           "v4l2src device=%s ! "
-          "video/x-raw,format=NV12,width=%d,height=%d,framerate=30/1",
+          "video/x-raw,format=YUY2,width=%d,height=%d,framerate=30/1",
           args.camera.c_str(), srcWidth, srcHeight);
   }
   return g_strdup("fakesrc");  // Unreachable

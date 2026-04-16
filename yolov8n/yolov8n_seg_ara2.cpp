@@ -143,12 +143,13 @@ struct AppData {
   GstElement *appsrc;      /* pushes rendered RGBA canvas */
   GstAllocator *dmabufAlloc;
 
-  /* Double-buffered canvas: render into one while waylandsink displays the other.
-   * Each push does dup(canvasFd) — GStreamer takes ownership of the dup'd fd
-   * and closes it on buffer unref. Our canvasFd stays alive for reuse. */
-  static const int NUM_CANVAS = 2;
-  hal_tensor *canvas[2];
-  int canvasFd[2];
+  /* Triple-buffered canvas: one is being displayed by waylandsink, one may be
+   * queued in appsrc, and we render into the third. Each push does dup(canvasFd)
+   * — GStreamer takes ownership of the dup'd fd and closes it on buffer unref.
+   * Our canvasFd stays alive for reuse. */
+  static const int NUM_CANVAS = 3;
+  hal_tensor *canvas[3];
+  int canvasFd[3];
   size_t canvasSize;
   int canvasIdx;
 
@@ -601,7 +602,7 @@ static void newDataCallback(GstElement *element, GstBuffer *buffer, gpointer use
       gst_app_src_push_buffer(GST_APP_SRC(app->appsrc), outBuf);
     }
   }
-  app->canvasIdx = 1 - ci;
+  app->canvasIdx = (ci + 1) % AppData::NUM_CANVAS;
 
   /* Free per-frame NN output tensors (NOT cached).
    * Background is cached by inode — do NOT free it here. */
@@ -684,7 +685,7 @@ int main(int argc, char **argv)
         "t. ! %s "
         "appsrc name=display stream-type=0 format=3 is-live=true "
         "do-timestamp=true max-buffers=2 block=false ! "
-        "waylandsink async=false",
+        "waylandsink sync=false async=false",
         srcStr, nnBranch);
   }
   g_free(srcStr);
@@ -693,7 +694,7 @@ int main(int argc, char **argv)
   log_info("Pipeline: %s\n\n", pipelineStr);
 
   AppData app = {};
-  app.canvasFd[0] = app.canvasFd[1] = -1;
+  app.canvasFd[0] = app.canvasFd[1] = app.canvasFd[2] = -1;
   app.canvasIdx = 0;
   app.maxFrames = pargs.numFrames;
   app.headless = pargs.headless;
@@ -712,11 +713,12 @@ int main(int argc, char **argv)
     app.srcHeight = SOURCE_HEIGHT;
     /* Derive pixel format from the source element chosen by buildSourceElement:
      *   libcamerasrc (i.MX 95)          → YUYV
-     *   v4l2src (i.MX 8M Plus)          → NV12
+     *   v4l2src (i.MX 8M Plus)          → YUYV
      *   v4l2h264dec (video file)        → NV12
      *   imagefreeze (static image)      → NV12
      * Using the wrong format silently corrupts the GPU background render. */
-    app.srcPixelFormat = (srcType == INPUT_CAMERA_LIBCAMERA)
+    app.srcPixelFormat = (srcType == INPUT_CAMERA_LIBCAMERA ||
+                          srcType == INPUT_CAMERA_V4L2)
         ? HAL_PIXEL_FORMAT_YUYV : HAL_PIXEL_FORMAT_NV12;
     for (int i = 0; i < AppData::NUM_CANVAS; i++) {
       app.canvas[i] = hal_image_processor_create_image(
@@ -726,9 +728,10 @@ int main(int argc, char **argv)
         app.canvasSize = hal_tensor_size(app.canvas[i]);
       }
     }
-    if (app.canvas[0] && app.canvas[1]) {
-      log_info("Canvas: %dx%d RGBA double-buffered, fds=[%d,%d], %zu bytes\n",
-               app.srcWidth, app.srcHeight, app.canvasFd[0], app.canvasFd[1], app.canvasSize);
+    if (app.canvas[0] && app.canvas[1] && app.canvas[2]) {
+      log_info("Canvas: %dx%d RGBA triple-buffered, fds=[%d,%d,%d], %zu bytes\n",
+               app.srcWidth, app.srcHeight,
+               app.canvasFd[0], app.canvasFd[1], app.canvasFd[2], app.canvasSize);
     }
   } else {
     log_error("HAL image processor failed\n");
