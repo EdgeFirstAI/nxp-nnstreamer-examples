@@ -656,6 +656,23 @@ int main(int argc, char **argv)
   InputSource srcType = determineInputSource(pargs, plat.usesLibcamerasrc);
   char *srcStr = buildSourceElement(srcType, pargs);
 
+  /* i.MX 8M Plus NV12 workaround: the Vivante GPU NV12-to-planar shader
+   * path in the HAL is unreliable (two-pass workaround for EDGEAI-1180
+   * produces corrupted model input).  For NV12 sources (video file, image)
+   * insert a HW G2D colour-space conversion to RGBA before the tee so both
+   * the appsink background and the NN branch receive RGBA. */
+  bool imx8mp_nv12_workaround = false;
+  if (platform == PLATFORM_IMX8MP &&
+      (srcType == INPUT_VIDEO || srcType == INPUT_IMAGE)) {
+    char *orig = srcStr;
+    srcStr = g_strdup_printf(
+        "%s ! imxvideoconvert_g2d ! video/x-raw,format=RGBA,width=%d,height=%d",
+        orig, SOURCE_WIDTH, SOURCE_HEIGHT);
+    g_free(orig);
+    imx8mp_nv12_workaround = true;
+    log_info("i.MX 8M Plus: NV12→RGBA via G2D (Vivante NV12 workaround)\n");
+  }
+
   /* NN branch */
   char *nnBranch = g_strdup_printf(
       "queue name=thread-nn leaky=2 max-size-buffers=2 ! "
@@ -714,12 +731,16 @@ int main(int argc, char **argv)
     /* Derive pixel format from the source element chosen by buildSourceElement:
      *   libcamerasrc (i.MX 95)          → YUYV
      *   v4l2src (i.MX 8M Plus)          → YUYV
-     *   v4l2h264dec (video file)        → NV12
-     *   imagefreeze (static image)      → NV12
+     *   v4l2h264dec (video file)        → NV12 (imx95) / RGBA via G2D (imx8mp)
+     *   imagefreeze (static image)      → NV12 (imx95) / RGBA via G2D (imx8mp)
      * Using the wrong format silently corrupts the GPU background render. */
-    app.srcPixelFormat = (srcType == INPUT_CAMERA_LIBCAMERA ||
-                          srcType == INPUT_CAMERA_V4L2)
-        ? HAL_PIXEL_FORMAT_YUYV : HAL_PIXEL_FORMAT_NV12;
+    if (imx8mp_nv12_workaround) {
+      app.srcPixelFormat = HAL_PIXEL_FORMAT_RGBA;
+    } else if (srcType == INPUT_CAMERA_LIBCAMERA || srcType == INPUT_CAMERA_V4L2) {
+      app.srcPixelFormat = HAL_PIXEL_FORMAT_YUYV;
+    } else {
+      app.srcPixelFormat = HAL_PIXEL_FORMAT_NV12;
+    }
     for (int i = 0; i < AppData::NUM_CANVAS; i++) {
       app.canvas[i] = hal_image_processor_create_image(
           app.processor, app.srcWidth, app.srcHeight, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
