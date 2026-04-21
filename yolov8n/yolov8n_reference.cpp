@@ -614,7 +614,7 @@ static char *buildPipeline(Platform platform, const ParsedArgs &pargs,
       "tensor_transform name=tshift1 mode=arithmetic option=typecast:int16,add:-128 ! "
       "tensor_transform name=tshift2 mode=typecast option=int8 ! "
       "tensor_filter name=tfilter framework=tensorflow-lite model=%s "
-      "custom=Delegate:External,ExtDelegateLib:%s latency=1 ! "
+      "custom=Delegate:External,ExtDelegateLib:%s,DmaBuf:false latency=1 ! "
       "tensor_sink name=inferenceOutput",
       source.c_str(),
       lb.scaledW, lb.scaledH,
