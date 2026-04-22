@@ -229,15 +229,33 @@ int main(int argc, char **argv)
 
   uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO |
                    ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES |
-                   ARG_COMPUTE | ARG_DETECTIONS;
+                   ARG_COMPUTE | ARG_DETECTIONS | ARG_PLATFORM;
 
   int ret = parseArgs(argc, argv, flags,
       "YOLOv8n Instance Segmentation — EdgeFirst Overlay Pipeline", pargs);
   if (ret != 0) return ret > 0 ? 0 : 1;
 
+  /* Platform selection — only i.MX 8M Plus is currently implemented.
+   * The tensor_filter pipeline below is hardcoded to libvx_delegate.so
+   * (VSI NPU), so running this binary on an i.MX 95 (Neutron delegate)
+   * would need both the delegate library and the model-colorspace/dtype
+   * to change.  Reject rather than run with the wrong stack silently.
+   * The imx95 path also does NOT need the NV12→RGBA workaround below. */
+  std::string platform = pargs.platformStr.empty() ? "imx8mp" : pargs.platformStr;
+  if (platform != "imx8mp") {
+    fprintf(stderr,
+        "ERROR: platform '%s' is not supported by yolov8n_seg yet.\n"
+        "       This binary hardcodes libvx_delegate.so (i.MX 8M Plus VSI NPU).\n"
+        "       imx95 (Neutron delegate) + matching cameraadaptor layout\n"
+        "       still needs to be wired up — see TODO in the source.\n",
+        platform.c_str());
+    return 1;
+  }
+
   gst_init(&argc, &argv);
 
   printf("YOLOv8n-seg — EdgeFirst Overlay Pipeline\n");
+  printf("  Platform: %s\n", platform.c_str());
   printf("  Model:   %s\n", pargs.model.c_str());
   if (!pargs.video.empty())
     printf("  Input:   video (%s)\n", pargs.video.c_str());
@@ -257,6 +275,41 @@ int main(int argc, char **argv)
   /* Build source element string */
   InputSource inputSrc = determineInputSource(pargs, false);
   char *srcStr = buildSourceElement(inputSrc, pargs);
+
+  /* i.MX 8M Plus NV12 workaround (imx8mp only — imx95 does not need this):
+   * v4l2h264dec outputs NV12 on imx8mp, and the Vivante GPU NV12-sampling
+   * path inside HAL's draw_decoded_masks composites at a few frames per
+   * second where RGBA composites at full pipeline rate.  For video sources,
+   * insert a HW G2D conversion to RGBA before the tee so both the overlay
+   * background import and the NN branch receive RGBA — same workaround
+   * yolov8n_seg_ara2 applies.  YUYV camera input (v4l2src) is already fast
+   * on Vivante, so no conversion is needed for live camera.
+   *
+   * On imx95 (Mali GPU), NV12 → RGBA in the HAL draw path is fast and
+   * this workaround must NOT be applied; the branch is guarded on
+   * platform == "imx8mp".  When imx95 support is added, the guard stays
+   * as-is and imx95 video input falls through unchanged. */
+  if (platform == "imx8mp" && inputSrc == INPUT_VIDEO) {
+    char *orig = srcStr;
+    srcStr = g_strdup_printf(
+        "%s ! imxvideoconvert_g2d ! video/x-raw,format=RGBA,width=%d,height=%d",
+        orig, SOURCE_WIDTH, SOURCE_HEIGHT);
+    g_free(orig);
+    printf("  NV12 workaround: inserting imxvideoconvert_g2d → RGBA before tee\n");
+  }
+
+  /* Pace file-based sources to their natural PTS rate so the decoder does
+   * not blast the whole stream through in a few hundred milliseconds.
+   * Without this, v4l2h264dec runs at decode speed (~200 FPS on imx8mp),
+   * overruns the leaky display-branch queue and the waylandsink clock-sync
+   * wall, and the pipeline appears to play a handful of frames then freeze
+   * until EOS unwinds the stall.  camera sources are already live-clocked
+   * and pass through unchanged. */
+  if (inputSrc == INPUT_VIDEO) {
+    char *orig = srcStr;
+    srcStr = g_strdup_printf("%s ! identity sync=true", orig);
+    g_free(orig);
+  }
 
   /* Build compute property strings */
   std::string computeCA, computeOV;
