@@ -142,6 +142,7 @@ enum ArgFlag {
   ARG_COMPUTE      = (1u << 10),
   ARG_DETECTIONS   = (1u << 11),
   ARG_COLOR_MODE   = (1u << 12),
+  ARG_SAVE_FRAME   = (1u << 13),
 };
 
 /** @brief Parsed CLI arguments */
@@ -156,6 +157,8 @@ struct ParsedArgs {
   bool instrumented = false;
   bool detections = false;
   std::string colorMode;   // edgefirstoverlay color-mode: class|instance|track
+  std::string saveFrame;   // save one frame to PNG at this path
+  int saveFrameDelay = 750; // frame number at which to save (default ~30s at 25fps)
   int numFrames = 0;
   double speed = 1.0;
   bool segmentation = false;

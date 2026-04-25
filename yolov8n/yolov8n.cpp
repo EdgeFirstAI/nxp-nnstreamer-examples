@@ -27,6 +27,7 @@
 
 #include <gst/gst.h>
 #include <gst/allocators/gstdmabuf.h>
+#include <gst/video/video-frame.h>
 #include <glib-unix.h>
 #include <getopt.h>
 #include <algorithm>
@@ -41,6 +42,7 @@
 
 #include "common/yolov8_common.hpp"
 #include <gst/edgefirst/edgefirstdetection.h>
+#include <tensorflow/lite/schema/schema_generated.h>
 
 
 /* ---- Backend / platform configuration --------------------------------- */
@@ -74,6 +76,37 @@ static bool hasSuffix(const std::string &str, const char *suffix) {
   return s.size() >= sfx.size() && s.compare(s.size() - sfx.size(), sfx.size(), sfx) == 0;
 }
 
+/* Read the input tensor quantization type directly from the .tflite FlatBuffer.
+ * This avoids hardcoding dtype per model — detection models use int8 while
+ * segmentation models use uint8, and this must match the cameraadaptor output. */
+static const char *queryTfliteInputDtype(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return "uint8";
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  std::vector<char> buf(sz);
+  if ((long)fread(buf.data(), 1, sz, f) != sz) { fclose(f); return "uint8"; }
+  fclose(f);
+
+  auto *model = tflite::GetModel(buf.data());
+  if (!model || !model->subgraphs() || model->subgraphs()->size() == 0)
+    return "uint8";
+  auto *sg = model->subgraphs()->Get(0);
+  if (!sg || !sg->inputs() || sg->inputs()->size() == 0 || !sg->tensors())
+    return "uint8";
+  int idx = sg->inputs()->Get(0);
+  if (idx < 0 || (uint32_t)idx >= sg->tensors()->size())
+    return "uint8";
+  auto type = sg->tensors()->Get(idx)->type();
+  switch (type) {
+    case tflite::TensorType_INT8:    return "int8";
+    case tflite::TensorType_UINT8:   return "uint8";
+    case tflite::TensorType_FLOAT32: return "float32";
+    default:                         return "uint8";
+  }
+}
+
 static const char *backendName(Backend b) {
   switch (b) {
     case BACKEND_TFLITE_VX:      return "TFLite VX Delegate";
@@ -81,6 +114,87 @@ static const char *backendName(Backend b) {
     case BACKEND_ARA2:           return "Ara-2";
   }
   return "Unknown";
+}
+
+
+/* ---- Save-frame: capture one frame from the pipeline as PNG ------- */
+
+struct SaveFrameCtx {
+  std::string path;
+  int targetFrame;
+  int currentFrame;
+  bool saved;
+};
+
+/* Save a GstBuffer as PNG using a one-shot GStreamer pipeline.
+ * Uses appsrc signal interface (no gst-app dependency needed). */
+static void saveBufferAsPng(GstBuffer *buffer, GstCaps *caps,
+                            const char *path)
+{
+  gchar *capsStr = gst_caps_to_string(caps);
+  gchar *pipeStr = g_strdup_printf(
+      "appsrc name=src caps=\"%s\" ! videoconvert ! video/x-raw,format=RGB "
+      "! pngenc ! filesink location=%s",
+      capsStr, path);
+  g_free(capsStr);
+
+  GError *err = NULL;
+  GstElement *pipe = gst_parse_launch(pipeStr, &err);
+  g_free(pipeStr);
+  if (!pipe) {
+    fprintf(stderr, "save-frame: failed to create pipeline: %s\n",
+            err ? err->message : "unknown");
+    if (err) g_error_free(err);
+    return;
+  }
+
+  GstElement *appsrc = gst_bin_get_by_name(GST_BIN(pipe), "src");
+  gst_element_set_state(pipe, GST_STATE_PLAYING);
+
+  GstBuffer *copy = gst_buffer_copy_deep(buffer);
+  GstFlowReturn ret;
+  g_signal_emit_by_name(appsrc, "push-buffer", copy, &ret);
+  gst_buffer_unref(copy);
+  g_signal_emit_by_name(appsrc, "end-of-stream", &ret);
+
+  GstBus *bus = gst_element_get_bus(pipe);
+  gst_bus_timed_pop_filtered(bus, 5 * GST_SECOND,
+      (GstMessageType)(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+  gst_object_unref(bus);
+
+  gst_element_set_state(pipe, GST_STATE_NULL);
+  gst_object_unref(appsrc);
+  gst_object_unref(pipe);
+}
+
+static GstPadProbeReturn saveFrameProbe(GstPad *pad, GstPadProbeInfo *info,
+                                        gpointer user_data)
+{
+  SaveFrameCtx *ctx = (SaveFrameCtx *)user_data;
+  if (ctx->saved)
+    return GST_PAD_PROBE_REMOVE;
+
+  ctx->currentFrame++;
+  if (ctx->currentFrame < ctx->targetFrame)
+    return GST_PAD_PROBE_OK;
+
+  ctx->saved = true;
+
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+  GstCaps *caps = gst_pad_get_current_caps(pad);
+  if (!caps || !buffer) {
+    if (caps) gst_caps_unref(caps);
+    fprintf(stderr, "save-frame: no caps or buffer at frame %d\n",
+            ctx->currentFrame);
+    return GST_PAD_PROBE_REMOVE;
+  }
+
+  printf("Saving frame %d to %s ...\n", ctx->currentFrame, ctx->path.c_str());
+  saveBufferAsPng(buffer, caps, ctx->path.c_str());
+  gst_caps_unref(caps);
+
+  printf("Frame saved to %s\n", ctx->path.c_str());
+  return GST_PAD_PROBE_REMOVE;
 }
 
 
@@ -276,7 +390,7 @@ int main(int argc, char **argv)
   uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO |
                    ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES |
                    ARG_COMPUTE | ARG_DETECTIONS | ARG_PLATFORM |
-                   ARG_COLOR_MODE;
+                   ARG_COLOR_MODE | ARG_SAVE_FRAME;
 
   int ret = parseArgs(argc, argv, flags,
       "YOLOv8n — EdgeFirst Overlay Pipeline", pargs);
@@ -386,7 +500,10 @@ int main(int argc, char **argv)
       ? "fakesink name=sink sync=false"
       : "waylandsink name=sink";
 
-  /* Backend-specific cameraadaptor and tensor_filter properties */
+  /* Backend-specific cameraadaptor and tensor_filter properties.
+   * For TFLite backends the input dtype is read from the model's FlatBuffer
+   * metadata — detection models are quantized to int8 while segmentation
+   * models use uint8, and the cameraadaptor output must match exactly. */
   const char *caDtype, *caLayout, *tfFramework, *tfCustom;
   const char *ovNormalized;
   switch (backend) {
@@ -398,15 +515,15 @@ int main(int argc, char **argv)
       ovNormalized = " normalized=false";
       break;
     case BACKEND_TFLITE_NEUTRON:
-      caDtype      = "uint8";
-      caLayout     = "model-colorspace=rgba";
+      caDtype      = queryTfliteInputDtype(pargs.model.c_str());
+      caLayout     = "model-colorspace=rgb";
       tfFramework  = "tensorflow2-lite";
       tfCustom     = "custom=Delegate:External,ExtDelegateLib:libneutron_delegate.so";
       ovNormalized = "";
       break;
     case BACKEND_TFLITE_VX:
     default:
-      caDtype      = "uint8";
+      caDtype      = queryTfliteInputDtype(pargs.model.c_str());
       caLayout     = "model-colorspace=rgba";
       tfFramework  = "tensorflow2-lite";
       tfCustom     = "custom=Delegate:External,ExtDelegateLib:libvx_delegate.so,CameraAdaptor:rgba,DmaBuf:true";
@@ -520,6 +637,26 @@ int main(int argc, char **argv)
 
   /* Shared per-element + full pipeline latency probes */
   app.probes.install(pipeline, "q-nn", "ca", "tfilter");
+
+  /* ---- Save-frame probe (screenshot from pipeline) ---- */
+
+  SaveFrameCtx saveCtx = {};
+  if (!pargs.saveFrame.empty()) {
+    saveCtx.path = pargs.saveFrame;
+    saveCtx.targetFrame = pargs.saveFrameDelay;
+    saveCtx.currentFrame = 0;
+    saveCtx.saved = false;
+
+    GstPad *sinkPad = gst_element_get_static_pad(
+        gst_bin_get_by_name(GST_BIN(pipeline), "sink"), "sink");
+    if (sinkPad) {
+      gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER,
+                         saveFrameProbe, &saveCtx, NULL);
+      gst_object_unref(sinkPad);
+      printf("  Save-frame: will capture frame %d to %s\n",
+             saveCtx.targetFrame, saveCtx.path.c_str());
+    }
+  }
 
   /* ---- Run ---- */
 

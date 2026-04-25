@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0)
 pkg_check_modules(GST_ALLOC REQUIRED gstreamer-allocators-1.0)
+pkg_check_modules(GST_VIDEO REQUIRED gstreamer-video-1.0)
 pkg_check_modules(CAIRO REQUIRED cairo)
 pkg_check_modules(NNSTREAMER REQUIRED nnstreamer)
 pkg_check_modules(EDGEFIRST_GST REQUIRED edgefirst-gstreamer-1.0)
@@ -21,6 +22,7 @@ find_package(OpenMP REQUIRED)
 include_directories(
   ${GSTREAMER_INCLUDE_DIRS}
   ${GST_ALLOC_INCLUDE_DIRS}
+  ${GST_VIDEO_INCLUDE_DIRS}
   ${CAIRO_INCLUDE_DIRS}
   ${NNSTREAMER_INCLUDE_DIRS}
   ${EDGEFIRST_GST_INCLUDE_DIRS}
@@ -31,6 +33,7 @@ include_directories(
 link_directories(
   ${GSTREAMER_LIBRARY_DIRS}
   ${GST_ALLOC_LIBRARY_DIRS}
+  ${GST_VIDEO_LIBRARY_DIRS}
   ${CAIRO_LIBRARY_DIRS}
   ${NNSTREAMER_LIBRARY_DIRS}
   ${EDGEFIRST_GST_LIBRARY_DIRS}
@@ -66,6 +69,7 @@ add_executable(yolov8n
 target_link_libraries(yolov8n
   ${GSTREAMER_LIBRARIES}
   ${GST_ALLOC_LIBRARIES}
+  ${GST_VIDEO_LIBRARIES}
   ${NNSTREAMER_LIBRARIES}
   ${EDGEFIRST_GST_LIBRARIES}
   edgefirst_hal
