@@ -12,8 +12,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0)
 pkg_check_modules(GST_ALLOC REQUIRED gstreamer-allocators-1.0)
-pkg_check_modules(GST_APP REQUIRED gstreamer-app-1.0)
-pkg_check_modules(GST_VIDEO REQUIRED gstreamer-video-1.0)
 pkg_check_modules(CAIRO REQUIRED cairo)
 pkg_check_modules(NNSTREAMER REQUIRED nnstreamer)
 pkg_check_modules(EDGEFIRST_GST REQUIRED edgefirst-gstreamer-1.0)
@@ -23,7 +21,6 @@ find_package(OpenMP REQUIRED)
 include_directories(
   ${GSTREAMER_INCLUDE_DIRS}
   ${GST_ALLOC_INCLUDE_DIRS}
-  ${GST_APP_INCLUDE_DIRS}
   ${CAIRO_INCLUDE_DIRS}
   ${NNSTREAMER_INCLUDE_DIRS}
   ${EDGEFIRST_GST_INCLUDE_DIRS}
@@ -34,7 +31,6 @@ include_directories(
 link_directories(
   ${GSTREAMER_LIBRARY_DIRS}
   ${GST_ALLOC_LIBRARY_DIRS}
-  ${GST_APP_LIBRARY_DIRS}
   ${CAIRO_LIBRARY_DIRS}
   ${NNSTREAMER_LIBRARY_DIRS}
   ${EDGEFIRST_GST_LIBRARY_DIRS}
@@ -59,45 +55,19 @@ target_link_libraries(yolov8n_reference
 )
 target_compile_options(yolov8n_reference PRIVATE "${OpenMP_CXX_FLAGS}")
 
-# --- yolov8n_imx95 ---
-# i.MX 95 Neutron NPU + EdgeFirst HAL for quantized NMS.
-add_executable(yolov8n_imx95
-  yolov8n_imx95.cpp
+# --- yolov8n ---
+# Unified EdgeFirst overlay pipeline for detection and instance segmentation.
+# Supports TFLite (VX/Neutron delegates) and Ara-2 backends on all platforms.
+# Model type (detection vs segmentation) is auto-detected from tensor shapes.
+add_executable(yolov8n
+  yolov8n.cpp
   ${COMMON_SRC}
 )
-target_link_libraries(yolov8n_imx95
+target_link_libraries(yolov8n
   ${GSTREAMER_LIBRARIES}
   ${GST_ALLOC_LIBRARIES}
-  ${CAIRO_LIBRARIES}
   ${NNSTREAMER_LIBRARIES}
-  edgefirst_hal
-)
-
-# --- yolov8n_imx8mp ---
-# i.MX 8M Plus with EdgeFirst DMA-BUF zero-copy + CameraAdaptor + HAL NMS.
-add_executable(yolov8n_imx8mp
-  yolov8n_imx8mp.cpp
-  ${COMMON_SRC}
-)
-target_link_libraries(yolov8n_imx8mp
-  ${GSTREAMER_LIBRARIES}
-  ${GST_ALLOC_LIBRARIES}
-  ${CAIRO_LIBRARIES}
-  ${NNSTREAMER_LIBRARIES}
-  edgefirst_hal
-)
-
-# --- yolov8n_ara2 ---
-# Kinara Ara-2 NPU + EdgeFirst HAL for quantized NMS.
-add_executable(yolov8n_ara2
-  yolov8n_ara2.cpp
-  ${COMMON_SRC}
-)
-target_link_libraries(yolov8n_ara2
-  ${GSTREAMER_LIBRARIES}
-  ${GST_ALLOC_LIBRARIES}
-  ${CAIRO_LIBRARIES}
-  ${NNSTREAMER_LIBRARIES}
+  ${EDGEFIRST_GST_LIBRARIES}
   edgefirst_hal
 )
 
@@ -114,33 +84,3 @@ target_link_libraries(yolov8n_ara2_reference
   ${NNSTREAMER_LIBRARIES}
 )
 
-# --- yolov8n_seg ---
-# Instance segmentation with EdgeFirst overlay element for mask rendering.
-# Uses edgefirst-gstreamer overlay — no Cairo or OpenMP needed.
-add_executable(yolov8n_seg
-  yolov8n_seg.cpp
-  ${COMMON_SRC}
-)
-target_link_libraries(yolov8n_seg
-  ${GSTREAMER_LIBRARIES}
-  ${GST_ALLOC_LIBRARIES}
-  ${NNSTREAMER_LIBRARIES}
-  ${EDGEFIRST_GST_LIBRARIES}
-  edgefirst_hal
-)
-
-# --- yolov8n_seg_ara2 ---
-# Instance segmentation with Ara-2 NPU + EdgeFirst HAL decode_proto + materialize_masks.
-# tensor_sink callback with programmatic HAL decoder auto-config from NNStreamer caps.
-add_executable(yolov8n_seg_ara2
-  yolov8n_seg_ara2.cpp
-  ${COMMON_SRC}
-)
-target_link_libraries(yolov8n_seg_ara2
-  ${GSTREAMER_LIBRARIES}
-  ${GST_ALLOC_LIBRARIES}
-  ${GST_APP_LIBRARIES}
-  ${GST_VIDEO_LIBRARIES}
-  ${NNSTREAMER_LIBRARIES}
-  edgefirst_hal
-)
