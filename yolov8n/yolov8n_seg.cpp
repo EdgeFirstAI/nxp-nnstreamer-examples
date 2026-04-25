@@ -23,19 +23,52 @@
 #include <gst/allocators/gstdmabuf.h>
 #include <glib-unix.h>
 #include <getopt.h>
+#include <algorithm>
+#include <cctype>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cinttypes>
-#include <string>
 #include <map>
+#include <string>
 #include <sys/time.h>
 
 #include "common/yolov8_common.hpp"
 #include <gst/edgefirst/edgefirstdetection.h>
 
 #define DEFAULT_MODEL   "/opt/edgefirst/models/yolov8n-seg_640x640.tflite"
-#define DEFAULT_CAMERA  "/dev/video3"
+
+
+/* ---- Backend / platform configuration --------------------------------- */
+
+enum Backend  { BACKEND_TFLITE, BACKEND_ARA2 };
+enum Platform { PLATFORM_IMX8MP, PLATFORM_IMX95 };
+
+struct PlatformConfig {
+  const char *name;
+  const char *defaultCamera;
+  bool usesLibcamerasrc;
+};
+
+static const PlatformConfig platformConfigs[] = {
+  [PLATFORM_IMX8MP] = {
+    .name = "i.MX 8M Plus",
+    .defaultCamera = "/dev/video3",
+    .usesLibcamerasrc = false,
+  },
+  [PLATFORM_IMX95] = {
+    .name = "i.MX 95",
+    .defaultCamera = NULL,
+    .usesLibcamerasrc = true,
+  },
+};
+
+static bool hasSuffix(const std::string &str, const char *suffix) {
+  std::string s = str, sfx = suffix;
+  std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+  std::transform(sfx.begin(), sfx.end(), sfx.begin(), ::tolower);
+  return s.size() >= sfx.size() && s.compare(s.size() - sfx.size(), sfx.size(), sfx) == 0;
+}
 
 
 /* ---- Application data ------------------------------------------------- */
@@ -225,7 +258,7 @@ int main(int argc, char **argv)
 {
   ParsedArgs pargs;
   pargs.model  = DEFAULT_MODEL;
-  pargs.camera = DEFAULT_CAMERA;
+  pargs.camera = "";  // filled from platform config if not set
 
   uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO |
                    ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES |
@@ -235,27 +268,41 @@ int main(int argc, char **argv)
       "YOLOv8n Instance Segmentation — EdgeFirst Overlay Pipeline", pargs);
   if (ret != 0) return ret > 0 ? 0 : 1;
 
-  /* Platform selection — only i.MX 8M Plus is currently implemented.
-   * The tensor_filter pipeline below is hardcoded to libvx_delegate.so
-   * (VSI NPU), so running this binary on an i.MX 95 (Neutron delegate)
-   * would need both the delegate library and the model-colorspace/dtype
-   * to change.  Reject rather than run with the wrong stack silently.
-   * The imx95 path also does NOT need the NV12→RGBA workaround below. */
-  std::string platform = pargs.platformStr.empty() ? "imx8mp" : pargs.platformStr;
-  if (platform != "imx8mp") {
+  /* ---- Detect backend from model extension ---- */
+  Backend backend = hasSuffix(pargs.model, ".dvm") ? BACKEND_ARA2 : BACKEND_TFLITE;
+  const char *backendName = (backend == BACKEND_ARA2) ? "Ara-2" : "TFLite VX Delegate";
+
+  /* ---- Platform selection ---- */
+  Platform platform = PLATFORM_IMX8MP;
+  if (!pargs.platformStr.empty()) {
+    if (pargs.platformStr == "imx95")       platform = PLATFORM_IMX95;
+    else if (pargs.platformStr == "imx8mp") platform = PLATFORM_IMX8MP;
+    else {
+      fprintf(stderr, "ERROR: Unknown platform '%s'. Use imx8mp or imx95.\n",
+              pargs.platformStr.c_str());
+      return 1;
+    }
+  }
+
+  /* TFLite VX delegate is only supported on imx8mp (imx95 needs Neutron) */
+  if (backend == BACKEND_TFLITE && platform == PLATFORM_IMX95) {
     fprintf(stderr,
-        "ERROR: platform '%s' is not supported by yolov8n_seg yet.\n"
-        "       This binary hardcodes libvx_delegate.so (i.MX 8M Plus VSI NPU).\n"
-        "       imx95 (Neutron delegate) + matching cameraadaptor layout\n"
-        "       still needs to be wired up — see TODO in the source.\n",
-        platform.c_str());
+        "ERROR: TFLite VX delegate is not supported on imx95.\n"
+        "       Use a .dvm model for Ara-2 inference on imx95.\n");
     return 1;
   }
+
+  const PlatformConfig &plat = platformConfigs[platform];
+  if (pargs.camera.empty() && plat.defaultCamera)
+    pargs.camera = plat.defaultCamera;
+  if (platform == PLATFORM_IMX95)
+    setupImx95Environment(false);
 
   gst_init(&argc, &argv);
 
   printf("YOLOv8n-seg — EdgeFirst Overlay Pipeline\n");
-  printf("  Platform: %s\n", platform.c_str());
+  printf("  Platform: %s\n", plat.name);
+  printf("  Backend:  %s\n", backendName);
   printf("  Model:   %s\n", pargs.model.c_str());
   if (!pargs.video.empty())
     printf("  Input:   video (%s)\n", pargs.video.c_str());
@@ -273,23 +320,14 @@ int main(int argc, char **argv)
   GMainLoop *loop = g_main_loop_new(NULL, FALSE);
 
   /* Build source element string */
-  InputSource inputSrc = determineInputSource(pargs, false);
+  InputSource inputSrc = determineInputSource(pargs, plat.usesLibcamerasrc);
   char *srcStr = buildSourceElement(inputSrc, pargs);
 
-  /* i.MX 8M Plus NV12 workaround (imx8mp only — imx95 does not need this):
-   * v4l2h264dec outputs NV12 on imx8mp, and the Vivante GPU NV12-sampling
-   * path inside HAL's draw_decoded_masks composites at a few frames per
-   * second where RGBA composites at full pipeline rate.  For video sources,
-   * insert a HW G2D conversion to RGBA before the tee so both the overlay
-   * background import and the NN branch receive RGBA — same workaround
-   * yolov8n_seg_ara2 applies.  YUYV camera input (v4l2src) is already fast
-   * on Vivante, so no conversion is needed for live camera.
-   *
-   * On imx95 (Mali GPU), NV12 → RGBA in the HAL draw path is fast and
-   * this workaround must NOT be applied; the branch is guarded on
-   * platform == "imx8mp".  When imx95 support is added, the guard stays
-   * as-is and imx95 video input falls through unchanged. */
-  if (platform == "imx8mp" && inputSrc == INPUT_VIDEO) {
+  /* i.MX 8M Plus NV12 workaround: v4l2h264dec outputs NV12 and the Vivante
+   * GPU NV12 sampling path is unreliable.  Insert HW G2D colour-space
+   * conversion to RGBA for video sources.  YUYV camera input (v4l2src) is
+   * already fast on Vivante.  imx95 (Mali GPU) handles NV12 natively. */
+  if (platform == PLATFORM_IMX8MP && inputSrc == INPUT_VIDEO) {
     char *orig = srcStr;
     srcStr = g_strdup_printf(
         "%s ! imxvideoconvert_g2d ! video/x-raw,format=RGBA,width=%d,height=%d",
@@ -298,13 +336,7 @@ int main(int argc, char **argv)
     printf("  NV12 workaround: inserting imxvideoconvert_g2d → RGBA before tee\n");
   }
 
-  /* Pace file-based sources to their natural PTS rate so the decoder does
-   * not blast the whole stream through in a few hundred milliseconds.
-   * Without this, v4l2h264dec runs at decode speed (~200 FPS on imx8mp),
-   * overruns the leaky display-branch queue and the waylandsink clock-sync
-   * wall, and the pipeline appears to play a handful of frames then freeze
-   * until EOS unwinds the stall.  camera sources are already live-clocked
-   * and pass through unchanged. */
+  /* Pace file-based sources to their natural PTS rate */
   if (inputSrc == INPUT_VIDEO) {
     char *orig = srcStr;
     srcStr = g_strdup_printf("%s ! identity sync=true", orig);
@@ -323,23 +355,42 @@ int main(int argc, char **argv)
       ? "fakesink name=sink sync=false"
       : "waylandsink name=sink";
 
+  /* Backend-specific cameraadaptor and tensor_filter properties */
+  const char *caDtype, *caLayout, *tfFramework, *tfCustom;
+  const char *ovNormalized;
+  if (backend == BACKEND_ARA2) {
+    caDtype      = "int8";
+    caLayout     = "model-layout=chw";
+    tfFramework  = "ara2";
+    tfCustom     = "custom=EnableStats:true";
+    ovNormalized = " normalized=false";  /* legacy Ara-2 DVM pixel-space hint;
+                                           * overridden by model-metadata when present */
+  } else {
+    caDtype      = "uint8";
+    caLayout     = "model-colorspace=rgba";
+    tfFramework  = "tensorflow2-lite";
+    tfCustom     = "custom=Delegate:External,ExtDelegateLib:libvx_delegate.so,CameraAdaptor:rgba,DmaBuf:true";
+    ovNormalized = "";  /* TFLite quant boxes are already [0,1] */
+  }
+
   /* Full pipeline string — gst_parse_launch handles dynamic pads (qtdemux) */
   gchar *pipeStr = g_strdup_printf(
       "%s ! tee name=t "
       "t. ! queue name=q-disp leaky=2 max-size-buffers=2 "
       "   ! edgefirstoverlay name=ov score-threshold=0.25 iou-threshold=0.45 "
-      "     decoder-version=yolov8%s "
+      "     decoder-version=yolov8%s%s "
       "   ! %s "
       "t. ! queue name=q-nn leaky=2 max-size-buffers=2 "
       "   ! edgefirstcameraadaptor name=ca model-width=640 model-height=640 "
-      "     model-dtype=uint8 model-colorspace=rgba letterbox=true%s "
-      "   ! tensor_filter name=tfilter framework=tensorflow2-lite "
+      "     model-dtype=%s %s letterbox=true%s "
+      "   ! tensor_filter name=tfilter framework=%s "
       "     model=%s "
-      "     custom=Delegate:External,ExtDelegateLib:libvx_delegate.so,CameraAdaptor:rgba,DmaBuf:true "
+      "     %s "
       "     latency=1 "
       "   ! ov.tensors",
-      srcStr, computeOV.c_str(), sinkStr, computeCA.c_str(),
-      pargs.model.c_str());
+      srcStr, ovNormalized, computeOV.c_str(), sinkStr,
+      caDtype, caLayout, computeCA.c_str(),
+      tfFramework, pargs.model.c_str(), tfCustom);
   g_free(srcStr);
 
   GError *err = NULL;
