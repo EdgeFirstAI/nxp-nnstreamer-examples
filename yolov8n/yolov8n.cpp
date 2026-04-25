@@ -1,12 +1,18 @@
 /*
- * YOLOv8n Instance Segmentation — EdgeFirst Overlay Pipeline
+ * YOLOv8n — EdgeFirst Overlay Pipeline (Unified Detection + Segmentation)
  * Copyright (C) 2026 Au-Zone Technologies
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Demonstrates YOLOv8n instance segmentation using the EdgeFirst native
- * GStreamer pipeline: edgefirstcameraadaptor for preprocessing and
- * edgefirstoverlay for GPU-accelerated mask/box drawing with detection
- * callbacks.
+ * Single binary supporting YOLOv8n detection and instance segmentation
+ * across all EdgeFirst-supported backends and platforms:
+ *
+ *   Backends:  TFLite (VX Delegate / Neutron) and Kinara Ara-2
+ *   Platforms: i.MX 8M Plus and i.MX 95
+ *
+ * The model type (detection vs. segmentation) is auto-detected by the
+ * edgefirstoverlay element from the tensor shapes — no flag needed.
+ * Backend is auto-detected from the model file extension (.tflite / .dvm).
+ * Platform must be specified with -p.
  *
  * Pipeline:
  *   [source] -> tee name=t
@@ -36,12 +42,10 @@
 #include "common/yolov8_common.hpp"
 #include <gst/edgefirst/edgefirstdetection.h>
 
-#define DEFAULT_MODEL   "/opt/edgefirst/models/yolov8n-seg_640x640.tflite"
-
 
 /* ---- Backend / platform configuration --------------------------------- */
 
-enum Backend  { BACKEND_TFLITE, BACKEND_ARA2 };
+enum Backend  { BACKEND_TFLITE_VX, BACKEND_TFLITE_NEUTRON, BACKEND_ARA2 };
 enum Platform { PLATFORM_IMX8MP, PLATFORM_IMX95 };
 
 struct PlatformConfig {
@@ -68,6 +72,15 @@ static bool hasSuffix(const std::string &str, const char *suffix) {
   std::transform(s.begin(), s.end(), s.begin(), ::tolower);
   std::transform(sfx.begin(), sfx.end(), sfx.begin(), ::tolower);
   return s.size() >= sfx.size() && s.compare(s.size() - sfx.size(), sfx.size(), sfx) == 0;
+}
+
+static const char *backendName(Backend b) {
+  switch (b) {
+    case BACKEND_TFLITE_VX:      return "TFLite VX Delegate";
+    case BACKEND_TFLITE_NEUTRON: return "TFLite Neutron Delegate";
+    case BACKEND_ARA2:           return "Ara-2";
+  }
+  return "Unknown";
 }
 
 
@@ -116,7 +129,7 @@ static void printTimingReport(void *userData)
   if (app->timingPrinted) return;
   app->timingPrinted = true;
 
-  printf("\n=== YOLOv8n-seg Timing Report ===\n");
+  printf("\n=== YOLOv8n Timing Report ===\n");
 
   int frames = app->throughput.metric.count > 0
       ? app->throughput.metric.count : app->frameCount;
@@ -133,7 +146,7 @@ static void printTimingReport(void *userData)
     printf("  Throughput:  %.1f FPS\n", avgMs > 0 ? 1000.0 / avgMs : 0);
   }
 
-  printf("=================================\n");
+  printf("=============================\n");
 }
 
 
@@ -206,8 +219,10 @@ static void onNewDetection(GstElement *,
 
   /* Print per-frame detections if -D is active */
   if (app->detections && nBoxes > 0) {
-    printf("[frame %d] %u detections, %u masks\n",
-           app->frameCount, nBoxes, nSegs);
+    printf("[frame %d] %u detections", app->frameCount, nBoxes);
+    if (nSegs > 0)
+      printf(", %u masks", nSegs);
+    printf("\n");
 
     for (guint i = 0; i < nBoxes; i++) {
       EdgeFirstDetectBox *box = edgefirst_detect_box_list_get(boxes, i);
@@ -216,7 +231,6 @@ static void onNewDetection(GstElement *,
       const char *name = (box->class_id >= 0 && box->class_id < NUM_CLASSES)
           ? cocoClassNames[box->class_id] : "?";
 
-      /* Mask dimensions if available */
       if (segs && i < nSegs) {
         EdgeFirstSegmentation *seg = edgefirst_segmentation_list_get(segs, i);
         if (seg) {
@@ -240,8 +254,7 @@ static void onNewDetection(GstElement *,
     }
   }
 
-  /* Shared full-latency tracking: now == callback start, use a fresh
-   * end timestamp so recordPost gets a non-zero delta. */
+  /* Shared full-latency tracking */
   struct timeval cbEnd;
   gettimeofday(&cbEnd, NULL);
   app->probes.recordPost(now, cbEnd);
@@ -257,39 +270,51 @@ static void onNewDetection(GstElement *,
 int main(int argc, char **argv)
 {
   ParsedArgs pargs;
-  pargs.model  = DEFAULT_MODEL;
-  pargs.camera = "";  // filled from platform config if not set
+  pargs.model  = "";  /* required — no default */
+  pargs.camera = "";
 
   uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO |
                    ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES |
                    ARG_COMPUTE | ARG_DETECTIONS | ARG_PLATFORM;
 
   int ret = parseArgs(argc, argv, flags,
-      "YOLOv8n Instance Segmentation — EdgeFirst Overlay Pipeline", pargs);
+      "YOLOv8n — EdgeFirst Overlay Pipeline", pargs);
   if (ret != 0) return ret > 0 ? 0 : 1;
 
-  /* ---- Detect backend from model extension ---- */
-  Backend backend = hasSuffix(pargs.model, ".dvm") ? BACKEND_ARA2 : BACKEND_TFLITE;
-  const char *backendName = (backend == BACKEND_ARA2) ? "Ara-2" : "TFLite VX Delegate";
-
-  /* ---- Platform selection ---- */
-  Platform platform = PLATFORM_IMX8MP;
-  if (!pargs.platformStr.empty()) {
-    if (pargs.platformStr == "imx95")       platform = PLATFORM_IMX95;
-    else if (pargs.platformStr == "imx8mp") platform = PLATFORM_IMX8MP;
-    else {
-      fprintf(stderr, "ERROR: Unknown platform '%s'. Use imx8mp or imx95.\n",
-              pargs.platformStr.c_str());
-      return 1;
-    }
+  /* ---- Validate model ---- */
+  if (pargs.model.empty()) {
+    fprintf(stderr, "ERROR: Model file is required. Use -m <path>.\n"
+                    "  Detection:     -m yolov8n_640x640.tflite\n"
+                    "  Segmentation:  -m yolov8n-seg_640x640.tflite\n"
+                    "  Ara-2 (DVM):   -m yolov8n_640x640.dvm\n");
+    return 1;
   }
 
-  /* TFLite VX delegate is only supported on imx8mp (imx95 needs Neutron) */
-  if (backend == BACKEND_TFLITE && platform == PLATFORM_IMX95) {
-    fprintf(stderr,
-        "ERROR: TFLite VX delegate is not supported on imx95.\n"
-        "       Use a .dvm model for Ara-2 inference on imx95.\n");
+  /* ---- Platform selection ---- */
+  if (pargs.platformStr.empty()) {
+    fprintf(stderr, "ERROR: Platform is required. Use -p imx8mp or -p imx95.\n");
     return 1;
+  }
+
+  Platform platform;
+  if (pargs.platformStr == "imx95")
+    platform = PLATFORM_IMX95;
+  else if (pargs.platformStr == "imx8mp")
+    platform = PLATFORM_IMX8MP;
+  else {
+    fprintf(stderr, "ERROR: Unknown platform '%s'. Use imx8mp or imx95.\n",
+            pargs.platformStr.c_str());
+    return 1;
+  }
+
+  /* ---- Detect backend from model extension ---- */
+  Backend backend;
+  if (hasSuffix(pargs.model, ".dvm")) {
+    backend = BACKEND_ARA2;
+  } else if (platform == PLATFORM_IMX95) {
+    backend = BACKEND_TFLITE_NEUTRON;
+  } else {
+    backend = BACKEND_TFLITE_VX;
   }
 
   const PlatformConfig &plat = platformConfigs[platform];
@@ -300,19 +325,19 @@ int main(int argc, char **argv)
 
   gst_init(&argc, &argv);
 
-  printf("YOLOv8n-seg — EdgeFirst Overlay Pipeline\n");
+  printf("YOLOv8n — EdgeFirst Overlay Pipeline\n");
   printf("  Platform: %s\n", plat.name);
-  printf("  Backend:  %s\n", backendName);
-  printf("  Model:   %s\n", pargs.model.c_str());
+  printf("  Backend:  %s\n", backendName(backend));
+  printf("  Model:    %s\n", pargs.model.c_str());
   if (!pargs.video.empty())
-    printf("  Input:   video (%s)\n", pargs.video.c_str());
+    printf("  Input:    video (%s)\n", pargs.video.c_str());
   else
-    printf("  Input:   camera (%s)\n", pargs.camera.c_str());
-  printf("  Mode:    %s\n", pargs.headless ? "headless" : "display");
+    printf("  Input:    camera (%s)\n", pargs.camera.c_str());
+  printf("  Mode:     %s\n", pargs.headless ? "headless" : "display");
   if (pargs.numFrames > 0)
-    printf("  Frames:  %d\n", pargs.numFrames);
+    printf("  Frames:   %d\n", pargs.numFrames);
   if (!pargs.compute.empty())
-    printf("  Compute: %s\n", pargs.compute.c_str());
+    printf("  Compute:  %s\n", pargs.compute.c_str());
   printf("\n");
 
   /* ---- Build pipeline via gst_parse_launch ---- */
@@ -358,19 +383,29 @@ int main(int argc, char **argv)
   /* Backend-specific cameraadaptor and tensor_filter properties */
   const char *caDtype, *caLayout, *tfFramework, *tfCustom;
   const char *ovNormalized;
-  if (backend == BACKEND_ARA2) {
-    caDtype      = "int8";
-    caLayout     = "model-layout=chw";
-    tfFramework  = "ara2";
-    tfCustom     = "custom=EnableStats:true";
-    ovNormalized = " normalized=false";  /* legacy Ara-2 DVM pixel-space hint;
-                                           * overridden by model-metadata when present */
-  } else {
-    caDtype      = "uint8";
-    caLayout     = "model-colorspace=rgba";
-    tfFramework  = "tensorflow2-lite";
-    tfCustom     = "custom=Delegate:External,ExtDelegateLib:libvx_delegate.so,CameraAdaptor:rgba,DmaBuf:true";
-    ovNormalized = "";  /* TFLite quant boxes are already [0,1] */
+  switch (backend) {
+    case BACKEND_ARA2:
+      caDtype      = "int8";
+      caLayout     = "model-layout=chw";
+      tfFramework  = "ara2";
+      tfCustom     = "custom=EnableStats:true";
+      ovNormalized = " normalized=false";
+      break;
+    case BACKEND_TFLITE_NEUTRON:
+      caDtype      = "uint8";
+      caLayout     = "model-colorspace=rgba";
+      tfFramework  = "tensorflow2-lite";
+      tfCustom     = "custom=Delegate:External,ExtDelegateLib:libneutron_delegate.so";
+      ovNormalized = "";
+      break;
+    case BACKEND_TFLITE_VX:
+    default:
+      caDtype      = "uint8";
+      caLayout     = "model-colorspace=rgba";
+      tfFramework  = "tensorflow2-lite";
+      tfCustom     = "custom=Delegate:External,ExtDelegateLib:libvx_delegate.so,CameraAdaptor:rgba,DmaBuf:true";
+      ovNormalized = "";
+      break;
   }
 
   /* Full pipeline string — gst_parse_launch handles dynamic pads (qtdemux) */
@@ -477,8 +512,7 @@ int main(int argc, char **argv)
     }
   }
 
-  /* Shared per-element + full pipeline latency probes.
-   * yolov8n_seg uses the inference-branch element names q-nn / ca / tfilter. */
+  /* Shared per-element + full pipeline latency probes */
   app.probes.install(pipeline, "q-nn", "ca", "tfilter");
 
   /* ---- Run ---- */
@@ -492,7 +526,7 @@ int main(int argc, char **argv)
 
   if (app.instrumented)
     printTimingReport(&app);
-  app.probes.printReport("YOLOv8n-seg — EdgeFirst Overlay Pipeline (per-element probes)");
+  app.probes.printReport("YOLOv8n — EdgeFirst Overlay Pipeline (per-element probes)");
   app.probes.teardown();
 
   gst_object_unref(overlay);
