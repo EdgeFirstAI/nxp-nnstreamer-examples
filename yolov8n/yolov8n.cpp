@@ -523,7 +523,9 @@ int main(int argc, char **argv)
       break;
     case BACKEND_TFLITE_VX:
     default:
-      caDtype      = queryTfliteInputDtype(pargs.model.c_str());
+      /* VX delegate DmaBuf mode requires uint8 tensor caps — the raw DMA-BUF
+       * memory is type-agnostic and the delegate handles int8 internally. */
+      caDtype      = "uint8";
       caLayout     = "model-colorspace=rgba";
       tfFramework  = "tensorflow2-lite";
       tfCustom     = "custom=Delegate:External,ExtDelegateLib:libvx_delegate.so,CameraAdaptor:rgba,DmaBuf:true";
