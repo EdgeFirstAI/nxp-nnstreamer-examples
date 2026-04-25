@@ -220,23 +220,26 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps, GstBuffer *buffer)
     app->tensor_dtypes[i] = nnstreamer_type_to_hal(type_parts[i]);
     if (app->tensor_ndims[i] == 3) {
       has_protos = true;
-      proto_channels = app->tensor_shapes[i][2];
+      proto_channels = app->tensor_shapes[i][0]; /* NCHW: C is outermost after reversal */
     }
   }
 
-  /* Identify tensor roles */
+  /* Identify tensor roles.
+   * After parse_nnstreamer_dims reversal + squeeze:
+   *   2D detection tensors: [features, anchors] — shape[0] is the feature count
+   *   3D protos tensor:     [C, H, W]           — shape[0] is channels */
   int protos_idx = -1, scores_idx = -1, boxes_idx = -1, coeffs_idx = -1;
   for (int i = 0; i < app->tensor_count; i++) {
     size_t ndim = app->tensor_ndims[i];
     if (ndim == 3) protos_idx = i;
-    else if (ndim == 2 && app->tensor_shapes[i][1] == 4) boxes_idx = i;
-    else if (ndim == 2 && has_protos && app->tensor_shapes[i][1] == proto_channels) coeffs_idx = i;
+    else if (ndim == 2 && app->tensor_shapes[i][0] == 4) boxes_idx = i;
+    else if (ndim == 2 && has_protos && app->tensor_shapes[i][0] == proto_channels) coeffs_idx = i;
     else if (scores_idx < 0) scores_idx = i;
   }
   if (coeffs_idx < 0 && protos_idx >= 0) {
     for (int i = 0; i < app->tensor_count; i++) {
       if (i == protos_idx || i == boxes_idx || i == scores_idx) continue;
-      if (app->tensor_ndims[i] == 2 && app->tensor_shapes[i][1] == proto_channels)
+      if (app->tensor_ndims[i] == 2 && app->tensor_shapes[i][0] == proto_channels)
         { coeffs_idx = i; break; }
     }
   }
@@ -253,15 +256,19 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps, GstBuffer *buffer)
 
   if (boxes_idx < 0 || scores_idx < 0) { log_error("Cannot identify boxes/scores\n"); return false; }
 
-  /* Compute HAL-convention shapes */
+  /* Compute HAL-convention shapes.
+   * After the innermost-first reversal, shapes are already in the correct
+   * outermost-first order. Just prepend batch dimension. */
   for (int i = 0; i < app->tensor_count; i++) {
     size_t *ns = app->tensor_shapes[i];
     if (i == protos_idx) {
-      app->hal_shapes[i][0] = 1; app->hal_shapes[i][1] = ns[2];
-      app->hal_shapes[i][2] = ns[0]; app->hal_shapes[i][3] = ns[1];
+      /* protos: [C, H, W] → HAL NCHW [1, C, H, W] */
+      app->hal_shapes[i][0] = 1; app->hal_shapes[i][1] = ns[0];
+      app->hal_shapes[i][2] = ns[1]; app->hal_shapes[i][3] = ns[2];
       app->hal_ndims[i] = 4;
     } else {
-      app->hal_shapes[i][0] = 1; app->hal_shapes[i][1] = ns[1]; app->hal_shapes[i][2] = ns[0];
+      /* detection: [features, anchors] → HAL [1, features, anchors] */
+      app->hal_shapes[i][0] = 1; app->hal_shapes[i][1] = ns[0]; app->hal_shapes[i][2] = ns[1];
       app->hal_ndims[i] = 3;
     }
   }
@@ -281,7 +288,7 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps, GstBuffer *buffer)
   hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
 
   auto add_split = [&](int idx, HalOutputType type, HalDimName d1) -> int {
-    size_t shape[3] = {1, app->tensor_shapes[idx][1], app->tensor_shapes[idx][0]};
+    size_t shape[3] = {1, app->tensor_shapes[idx][0], app->tensor_shapes[idx][1]};
     HalDimName dims[3] = {HAL_DIM_NAME_BATCH, d1, HAL_DIM_NAME_NUM_BOXES};
     int r = hal_decoder_params_add_output(params, type, HAL_DECODER_TYPE_ULTRALYTICS, shape, dims, 3);
     if (r >= 0) hal_decoder_params_output_set_quantization(params, r, (float)qp[idx].scale, (int)qp[idx].zeroPoint);
@@ -296,7 +303,8 @@ static bool auto_config_decoder(AppData *app, GstCaps *caps, GstBuffer *buffer)
 
   if (protos_idx >= 0) {
     size_t *ns = app->tensor_shapes[protos_idx];
-    size_t shape[4] = {1, ns[2], ns[0], ns[1]};
+    /* protos shape after reversal: [C, H, W] — already NCHW order */
+    size_t shape[4] = {1, ns[0], ns[1], ns[2]};
     HalDimName dims[4] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_NUM_PROTOS, HAL_DIM_NAME_HEIGHT, HAL_DIM_NAME_WIDTH};
     int pi = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_PROTOS, HAL_DECODER_TYPE_ULTRALYTICS, shape, dims, 4);
     if (pi >= 0) hal_decoder_params_output_set_quantization(params, pi, (float)qp[protos_idx].scale, (int)qp[protos_idx].zeroPoint);
