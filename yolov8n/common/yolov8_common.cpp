@@ -148,6 +148,11 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
     opts.push_back({"color-mode", required_argument, 0, 'M'});
     shortOpts += "M:";
   }
+  if (supportedFlags & ARG_SAVE_FRAME) {
+    opts.push_back({"save-frame", required_argument, 0, 'F'});
+    opts.push_back({"save-frame-delay", required_argument, 0, 'f'});
+    shortOpts += "F:f:";
+  }
 
   // Sentinel
   opts.push_back({0, 0, 0, 0});
@@ -189,6 +194,9 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
           std::cout << "  -D, --detections        Print detection details per frame\n";
         if (supportedFlags & ARG_COLOR_MODE)
           std::cout << "  -M, --color-mode MODE   Overlay coloring: class|instance|track (default: class)\n";
+        if (supportedFlags & ARG_SAVE_FRAME)
+          std::cout << "  -F, --save-frame PATH   Save one frame as PNG (for screenshots/QA)\n"
+                    << "  -f, --save-frame-delay N Frame number at which to save (default: 750)\n";
         return 1;
       }
       case 'm': args.model = optarg; break;
@@ -204,6 +212,8 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
       case 'C': args.compute = optarg; break;
       case 'D': args.detections = true; break;
       case 'M': args.colorMode = optarg; break;
+      case 'F': args.saveFrame = optarg; break;
+      case 'f': args.saveFrameDelay = atoi(optarg); break;
       case '?':
         return -1;
     }
