@@ -141,6 +141,7 @@ enum ArgFlag {
   ARG_SEG          = (1u << 9),
   ARG_COMPUTE      = (1u << 10),
   ARG_DETECTIONS   = (1u << 11),
+  ARG_COLOR_MODE   = (1u << 12),
 };
 
 /** @brief Parsed CLI arguments */
@@ -154,6 +155,7 @@ struct ParsedArgs {
   bool headless = false;
   bool instrumented = false;
   bool detections = false;
+  std::string colorMode;   // edgefirstoverlay color-mode: class|instance|track
   int numFrames = 0;
   double speed = 1.0;
   bool segmentation = false;

@@ -144,6 +144,10 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
     opts.push_back({"detections", no_argument, 0, 'D'});
     shortOpts += "D";
   }
+  if (supportedFlags & ARG_COLOR_MODE) {
+    opts.push_back({"color-mode", required_argument, 0, 'M'});
+    shortOpts += "M:";
+  }
 
   // Sentinel
   opts.push_back({0, 0, 0, 0});
@@ -183,6 +187,8 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
           std::cout << "  -C, --compute BACKEND   edgefirstcameraadaptor backend: auto|opengl|g2d|cpu (default: auto)\n";
         if (supportedFlags & ARG_DETECTIONS)
           std::cout << "  -D, --detections        Print detection details per frame\n";
+        if (supportedFlags & ARG_COLOR_MODE)
+          std::cout << "  -M, --color-mode MODE   Overlay coloring: class|instance|track (default: class)\n";
         return 1;
       }
       case 'm': args.model = optarg; break;
@@ -197,6 +203,7 @@ int parseArgs(int argc, char **argv, uint32_t supportedFlags,
       case 'S': args.segmentation = true; break;
       case 'C': args.compute = optarg; break;
       case 'D': args.detections = true; break;
+      case 'M': args.colorMode = optarg; break;
       case '?':
         return -1;
     }

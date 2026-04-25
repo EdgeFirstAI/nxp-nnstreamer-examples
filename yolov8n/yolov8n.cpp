@@ -275,7 +275,8 @@ int main(int argc, char **argv)
 
   uint32_t flags = ARG_MODEL | ARG_CAMERA | ARG_VIDEO |
                    ARG_HEADLESS | ARG_INSTRUMENTED | ARG_NUM_FRAMES |
-                   ARG_COMPUTE | ARG_DETECTIONS | ARG_PLATFORM;
+                   ARG_COMPUTE | ARG_DETECTIONS | ARG_PLATFORM |
+                   ARG_COLOR_MODE;
 
   int ret = parseArgs(argc, argv, flags,
       "YOLOv8n — EdgeFirst Overlay Pipeline", pargs);
@@ -375,6 +376,11 @@ int main(int argc, char **argv)
     computeOV = std::string(" compute=") + pargs.compute;
   }
 
+  /* Build color-mode property for overlay */
+  std::string colorModeProp;
+  if (!pargs.colorMode.empty())
+    colorModeProp = std::string(" color-mode=") + pargs.colorMode;
+
   /* Sink element */
   const char *sinkStr = pargs.headless
       ? "fakesink name=sink sync=false"
@@ -413,7 +419,7 @@ int main(int argc, char **argv)
       "%s ! tee name=t "
       "t. ! queue name=q-disp leaky=2 max-size-buffers=2 "
       "   ! edgefirstoverlay name=ov score-threshold=0.25 iou-threshold=0.45 "
-      "     decoder-version=yolov8%s%s "
+      "     decoder-version=yolov8%s%s%s "
       "   ! %s "
       "t. ! queue name=q-nn leaky=2 max-size-buffers=2 "
       "   ! edgefirstcameraadaptor name=ca model-width=640 model-height=640 "
@@ -423,7 +429,7 @@ int main(int argc, char **argv)
       "     %s "
       "     latency=1 "
       "   ! ov.tensors",
-      srcStr, ovNormalized, computeOV.c_str(), sinkStr,
+      srcStr, ovNormalized, colorModeProp.c_str(), computeOV.c_str(), sinkStr,
       caDtype, caLayout, computeCA.c_str(),
       tfFramework, pargs.model.c_str(), tfCustom);
   g_free(srcStr);
