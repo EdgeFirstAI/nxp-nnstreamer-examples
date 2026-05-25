@@ -41,6 +41,7 @@
 #include <sys/time.h>
 
 #include "common/yolov8_common.hpp"
+#include "edgefirst_json_extract.hpp"
 #include <gst/edgefirst/edgefirstdetection.h>
 #include <tensorflow/lite/schema/schema_generated.h>
 
@@ -569,6 +570,34 @@ int main(int argc, char **argv)
   if (!overlay || !ca || !tfilter) {
     g_printerr("Failed to find named elements in pipeline\n");
     return 1;
+  }
+
+  /*
+   * Inject the embedded edgefirst.json from the .tflite if present.
+   *
+   * EdgeFirst Studio's converter appends a ZIP archive to the end of
+   * the FlatBuffer carrying edgefirst.json (HAL decoder schema) and
+   * labels.txt. The schema declares per-role quantization that the
+   * runtime tensor metadata alone cannot expose — required for the
+   * "smart" u8/i8 quantization scheme where boxes and scores channels
+   * within a single output tensor are quantized independently.
+   *
+   * When the model has no embedded schema (older _640x640 exports,
+   * plain Ultralytics TFLite, etc.) the overlay falls back to its
+   * decoder-version=yolov8 + tensor-shape inference path. Both modes
+   * work; this just unlocks newer model formats.
+   */
+  if (pargs.model.find(".tflite") != std::string::npos) {
+    auto schema = extract_edgefirst_json_from_tflite(pargs.model);
+    if (schema) {
+      g_print("Schema:   edgefirst.json embedded (%zu bytes) "
+              "— applied to overlay as model-config\n",
+              schema->size());
+      g_object_set(overlay, "model-config", schema->c_str(), NULL);
+    } else {
+      g_print("Schema:   none embedded "
+              "— overlay using decoder-version=yolov8 fallback\n");
+    }
   }
 
   /* ---- Initialize app data ---- */
