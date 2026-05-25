@@ -17,6 +17,9 @@ pkg_check_modules(CAIRO REQUIRED cairo)
 pkg_check_modules(NNSTREAMER REQUIRED nnstreamer)
 pkg_check_modules(EDGEFIRST_GST REQUIRED edgefirst-gstreamer-1.0)
 find_package(OpenMP REQUIRED)
+# zlib: used by yolov8n to inflate the edgefirst.json embedded in the
+# TFLite associated-files ZIP trailer.
+find_package(ZLIB REQUIRED)
 
 # Include directories
 include_directories(
@@ -64,6 +67,7 @@ target_compile_options(yolov8n_reference PRIVATE "${OpenMP_CXX_FLAGS}")
 # Model type (detection vs segmentation) is auto-detected from tensor shapes.
 add_executable(yolov8n
   yolov8n.cpp
+  edgefirst_json_extract.cpp
   ${COMMON_SRC}
 )
 target_link_libraries(yolov8n
@@ -73,6 +77,7 @@ target_link_libraries(yolov8n
   ${NNSTREAMER_LIBRARIES}
   ${EDGEFIRST_GST_LIBRARIES}
   edgefirst_hal
+  ZLIB::ZLIB
 )
 
 # --- yolov8n_ara2_reference ---
