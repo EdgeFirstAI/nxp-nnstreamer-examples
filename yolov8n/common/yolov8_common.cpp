@@ -432,6 +432,9 @@ void PipelineProbes::reset()
   inference.reset();
   postproc.reset();
   fullLatency.reset();
+  decode.reset();
+  materialize.reset();
+  draw.reset();
   queueSinkStart = {};
   queueSrcEnd = {};
   preprocStart = {};
@@ -440,6 +443,29 @@ void PipelineProbes::reset()
   filterSrcEnd = {};
   currentFrameQueueStart = {};
   tensorFilter = nullptr;
+}
+
+/* Frame-timing signal handler. Connected to edgefirstoverlay's
+ * "frame-timing" signal — fires once per video frame after the GL draw
+ * completes, with the just-measured (decode_ms, materialize_ms, draw_ms)
+ * from inside the overlay element. */
+static void pp_onFrameTiming(GstElement * /*overlay*/, gdouble decode_ms,
+                             gdouble materialize_ms, gdouble draw_ms,
+                             gpointer user_data)
+{
+  PipelineProbes *p = (PipelineProbes *)user_data;
+  p->decode.record(decode_ms);
+  p->materialize.record(materialize_ms);
+  p->draw.record(draw_ms);
+}
+
+bool PipelineProbes::installOverlayTiming(GstElement *overlay)
+{
+  if (!overlay) return false;
+  g_object_set(overlay, "expose-timing", TRUE, NULL);
+  g_signal_connect(overlay, "frame-timing",
+                   G_CALLBACK(pp_onFrameTiming), this);
+  return true;
 }
 
 /** Helper: install a probe pair (sink+src) on a named element. */
@@ -531,6 +557,14 @@ void PipelineProbes::printReport(const char *title) const
   pp_print_metric("tensor_filter element (GST total)",  filterElement);
   pp_print_metric("  └─ NPU Invoke (internal latency)", inference);
   pp_print_metric("tensor_sink callback (post-process)",postproc);
+
+  if (decode.count > 0 || materialize.count > 0 || draw.count > 0) {
+    printf("\n  OVERLAY ELEMENT (frame-timing signal from edgefirstoverlay)\n");
+    printf("  --------------------------------------------------------------------------\n");
+    pp_print_metric("edgefirstoverlay decode  (NMS+boxes)",     decode);
+    pp_print_metric("edgefirstoverlay materialize (CPU masks)", materialize);
+    pp_print_metric("edgefirstoverlay draw    (GL composite)",  draw);
+  }
 
   printf("\n  FULL PIPELINE LATENCY (queue sink → end of post-processing)\n");
   printf("  --------------------------------------------------------------------------\n");

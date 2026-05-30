@@ -288,6 +288,14 @@ struct PipelineProbes {
   TimingMetric postproc;         // tensor_sink callback total time
   TimingMetric fullLatency;      // queue sink → end of post-processing
 
+  // Per-frame timings populated by the overlay's `frame-timing` signal.
+  // decode/materialize are emitted from the tensor chain inside the
+  // overlay; draw is emitted from the video chain. Each value covers
+  // exactly one frame's work, so the averages are directly addable.
+  TimingMetric decode;
+  TimingMetric materialize;
+  TimingMetric draw;
+
   // Per-buffer probe state (set by upstream/downstream-thread probes)
   struct timeval queueSinkStart;
   struct timeval queueSrcEnd;
@@ -322,6 +330,20 @@ struct PipelineProbes {
                const char *queueName,
                const char *preprocName,
                const char *filterName);
+
+  /**
+   * @brief Wire the edgefirstoverlay `frame-timing` signal into decode /
+   * materialize / draw metrics.
+   *
+   * Sets the overlay's `expose-timing` property to TRUE and connects the
+   * signal so per-frame measurements flow into the corresponding
+   * TimingMetric fields. Safe to call before the pipeline reaches PLAYING.
+   *
+   * @param overlay edgefirstoverlay element pointer (gst_bin_get_by_name).
+   *                Caller retains ownership.
+   * @return true if the signal connected
+   */
+  bool installOverlayTiming(GstElement *overlay);
 
   /** Release the cached tensor_filter reference. */
   void teardown();

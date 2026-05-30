@@ -669,6 +669,12 @@ int main(int argc, char **argv)
   /* Shared per-element + full pipeline latency probes */
   app.probes.install(pipeline, "q-nn", "ca", "tfilter");
 
+  /* Overlay element timing (decode + materialize + draw via frame-timing
+   * signal). Enabled only in instrumented mode so production runs do not
+   * pay the per-frame signal-emit cost. */
+  if (app.instrumented)
+    app.probes.installOverlayTiming(overlay);
+
   /* ---- Save-frame probe (screenshot from pipeline) ---- */
 
   SaveFrameCtx saveCtx = {};
