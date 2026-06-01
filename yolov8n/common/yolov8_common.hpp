@@ -54,30 +54,81 @@ static inline double timeDiffMs(const struct timeval &start, const struct timeva
 }
 
 
-/** @brief Single timing metric with min/max/avg tracking */
+/** @brief Single timing metric with full-sample storage.
+ *
+ * Stores every accepted sample so the printer can compute robust statistics:
+ *   - trimmed mean over samples ≤ p99 (default headline metric)
+ *   - p50 (median) and p99 cutoff
+ *   - min / max / total count for context
+ *
+ * Discards the first @c warmupSkip samples to filter pipeline initialisation
+ * costs (GL warmup, JIT, page-fault, DMA-BUF pool growth). Default skip is
+ * 200 frames; callers can override per-metric via @c setWarmup().
+ *
+ * Bogus samples (≤0 or ≥1000 ms) are silently dropped at @c record().
+ */
 typedef struct {
-  double totalMs;
-  int count;
+  std::vector<double> samples;
+  double totalMs;            // sum over kept (post-warmup) samples — back-compat avg()
+  int count;                 // kept-sample count (warmup excluded); == samples.size()
+  int rawCount;              // raw record() calls accepted (incl. warmup)
+  int warmupSkip;            // first N raw samples are discarded as warmup
   double minMs;
   double maxMs;
 
   void reset() {
+    samples.clear();
+    samples.reserve(2048);
     totalMs = 0;
     count = 0;
+    rawCount = 0;
+    warmupSkip = 200;
     minMs = 1e9;
     maxMs = 0;
   }
 
+  void setWarmup(int n) { warmupSkip = n; }
+
   void record(double ms) {
-    if (ms > 0 && ms < 1000) {  // Filter bogus values
-      totalMs += ms;
-      count++;
-      if (ms < minMs) minMs = ms;
-      if (ms > maxMs) maxMs = ms;
-    }
+    if (!(ms > 0 && ms < 1000)) return;  // filter bogus values
+    rawCount++;
+    if (rawCount <= warmupSkip) return;  // discard warmup
+    samples.push_back(ms);
+    totalMs += ms;
+    count++;
+    if (ms < minMs) minMs = ms;
+    if (ms > maxMs) maxMs = ms;
   }
 
+  /** Untrimmed mean over kept samples (warmup already excluded). */
   double avg() const { return count > 0 ? totalMs / count : 0; }
+
+  /** Generic percentile (0.0..1.0). Sorts internally. */
+  double percentile(double q) const {
+    if (samples.empty()) return 0;
+    std::vector<double> sorted = samples;
+    std::sort(sorted.begin(), sorted.end());
+    size_t idx = (size_t)(sorted.size() * q);
+    if (idx >= sorted.size()) idx = sorted.size() - 1;
+    return sorted[idx];
+  }
+
+  double p50() const { return percentile(0.50); }
+  double p99() const { return percentile(0.99); }
+
+  /** Mean of samples in [0, p99] — drops the top 1% outliers.
+   *  Robust to scheduler/GC tail spikes; the methodology used for all
+   *  v1.2.3 stage numbers reported in chapter 4 of the user manual. */
+  double trimmedMean(double cutoff = 0.99) const {
+    if (samples.empty()) return 0;
+    std::vector<double> sorted = samples;
+    std::sort(sorted.begin(), sorted.end());
+    size_t n = (size_t)(sorted.size() * cutoff);
+    if (n == 0) n = sorted.size();
+    double s = 0;
+    for (size_t i = 0; i < n; i++) s += sorted[i];
+    return s / n;
+  }
 } TimingMetric;
 
 

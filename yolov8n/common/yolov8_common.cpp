@@ -78,8 +78,10 @@ void printMetric(const char *label, const char *desc, const TimingMetric &metric
     printf("  %s\n", label);
     if (desc)
       printf("     (%s)\n", desc);
-    printf("     Average: %7.3f ms  |  Min: %7.3f ms  |  Max: %7.3f ms  [%d frames]\n",
-           metric.avg(), metric.minMs, metric.maxMs, metric.count);
+    printf("     Avg(p99-trimmed): %7.3f ms  |  p50: %7.3f  |  p99: %7.3f  |  min: %7.3f  |  max: %7.3f  [N=%d, warmup skipped %d]\n",
+           metric.trimmedMean(), metric.p50(), metric.p99(),
+           metric.minMs, metric.maxMs,
+           metric.count, metric.warmupSkip);
   }
 }
 
@@ -536,8 +538,9 @@ void PipelineProbes::recordInference()
 static void pp_print_metric(const char *label, const TimingMetric &m)
 {
   if (m.count > 0) {
-    printf("     %-52s  avg %7.3f ms  min %7.3f ms  max %7.3f ms  [%d]\n",
-           label, m.avg(), m.minMs, m.maxMs, m.count);
+    printf("     %-52s  avg(p99) %7.3f  p50 %7.3f  p99 %7.3f  min %7.3f  max %7.3f  [N=%d, warmup %d]\n",
+           label, m.trimmedMean(), m.p50(), m.p99(),
+           m.minMs, m.maxMs, m.count, m.warmupSkip);
   } else {
     printf("     %-52s  (no samples)\n", label);
   }

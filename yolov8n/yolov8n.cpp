@@ -437,7 +437,7 @@ int main(int argc, char **argv)
   if (pargs.camera.empty() && plat.defaultCamera)
     pargs.camera = plat.defaultCamera;
   if (platform == PLATFORM_IMX95)
-    setupImx95Environment(false);
+    setupImx95Environment(backend == BACKEND_TFLITE_NEUTRON);
 
   gst_init(&argc, &argv);
 
